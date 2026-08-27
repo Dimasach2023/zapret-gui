@@ -132,9 +132,17 @@ function renderState(state) {
         sel.appendChild(opt);
       }
     }
-    fakeDiscordSelect.value = 'ACTIVE_DISCORD_UDP.bin';
-    fakeGameSelect.value = 'ACTIVE_GAME_UDP.bin';
     binFilesLoaded = true;
+  }
+  // выставляем реально применённый файл (хранится в config.json), а не дефолт —
+  // раньше значение всегда сбрасывалось на ACTIVE_*.bin при каждом запуске GUI
+  if (binFilesLoaded) {
+    if (state.activeFakeDiscord && [...fakeDiscordSelect.options].some((o) => o.value === state.activeFakeDiscord)) {
+      fakeDiscordSelect.value = state.activeFakeDiscord;
+    }
+    if (state.activeFakeGame && [...fakeGameSelect.options].some((o) => o.value === state.activeFakeGame)) {
+      fakeGameSelect.value = state.activeFakeGame;
+    }
   }
 }
 

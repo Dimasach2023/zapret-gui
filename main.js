@@ -122,9 +122,21 @@ let config = Object.assign(
     gameFilterMode: 'off', // off | tcp | udp | all
     autostartApp: false,
     autostartWinws: false,
+    autoUpdateCheck: false,
+    // какой .bin-файл сейчас скопирован в ACTIVE_DISCORD_UDP.bin / ACTIVE_GAME_UDP.bin —
+    // раньше нигде не сохранялось, поэтому выбор в селекторах «слетал» на дефолт
+    // после каждого перезапуска GUI, даже если сам файл оставался применённым.
+    activeFakeDiscord: 'ACTIVE_DISCORD_UDP.bin',
+    activeFakeGame: 'ACTIVE_GAME_UDP.bin',
   },
   loadConfigFile()
 );
+// Миграция: если раньше настройка хранилась только как файл-флаг внутри
+// папки приложения (что «слетало» при обновлении/переустановке или из-за
+// антивируса), подхватим её значение один раз при первом запуске новой версии.
+if (loadConfigFile().autoUpdateCheck === undefined && fs.existsSync(CHECK_UPDATES_FLAG)) {
+  config.autoUpdateCheck = true;
+}
 
 // ---------- utils ----------
 function sendLog(line) {
@@ -450,6 +462,13 @@ async function updateHostsFile() {
   }
 }
 function toggleAutoUpdateCheck(enable) {
+  // Основной источник истины — config.json в userData (переживает обновления
+  // приложения и не зависит от прав на папку установки).
+  config.autoUpdateCheck = !!enable;
+  saveConfig();
+  // Файл-флаг в utils/ дублируем «best effort» для внешних .bat/.ps1 скриптов
+  // zapret, которые могут на него смотреть, но его потеря больше не влияет
+  // на состояние галочки в GUI.
   try {
     fs.mkdirSync(UTILS_DIR, { recursive: true });
     if (enable) fs.writeFileSync(CHECK_UPDATES_FLAG, '', 'utf-8');
@@ -457,8 +476,7 @@ function toggleAutoUpdateCheck(enable) {
     sendLog(`> Автопроверка обновлений: ${enable ? 'включена' : 'выключена'}.`);
     notify('success', `Автопроверка обновлений ${enable ? 'включена' : 'выключена'}.`);
   } catch (e) {
-    sendLog('[WARN] ' + e.message);
-    notify('error', e.message);
+    sendLog('[WARN] Не удалось продублировать флаг в utils/ (настройка в GUI всё равно сохранена): ' + e.message);
   }
   pushState();
 }
@@ -601,6 +619,11 @@ function replaceActiveFake(slot, sourceFile) {
   try {
     if (!fs.existsSync(source)) throw new Error('файл не найден: ' + sourceFile);
     fs.copyFileSync(source, target);
+    // запоминаем выбор в config.json, иначе после перезапуска GUI селектор
+    // всегда показывал бы дефолтный ACTIVE_*.bin вместо реально применённого файла
+    if (slot === 'discord') config.activeFakeDiscord = sourceFile;
+    else config.activeFakeGame = sourceFile;
+    saveConfig();
     sendLog(`> ${targetName} заменён на ${sourceFile}.`);
     notify('success', `${targetName} заменён на ${sourceFile}.`);
   } catch (e) {
@@ -701,6 +724,10 @@ async function autoPickFake(slot, testHost, testPort) {
     if (successful.length > 0) {
       const best = successful[0];
       fs.copyFileSync(bin(best.file), target);
+      // как и при ручной замене — фиксируем выбор, чтобы он не слетал после перезапуска GUI
+      if (slot === 'discord') config.activeFakeDiscord = best.file;
+      else config.activeFakeGame = best.file;
+      saveConfig();
       startWinws();
       sendLog(`> Лучший результат: ${best.file} (${best.ms} мс). Применён и запущен.`);
       notify('success', `Автоподбор завершён: лучший файл — ${best.file} (${best.ms} мс).`);
@@ -814,8 +841,10 @@ async function getStateObject() {
     platform: process.platform,
     ipsetStatus: ipsetStatus(),
     customHostsApplied: customHostsApplied(),
-    autoUpdateCheck: fs.existsSync(CHECK_UPDATES_FLAG),
+    autoUpdateCheck: config.autoUpdateCheck,
     binFiles: listBinFiles(),
+    activeFakeDiscord: config.activeFakeDiscord,
+    activeFakeGame: config.activeFakeGame,
     serviceState,
     windivertState,
     localVersion: LOCAL_VERSION,
@@ -896,6 +925,7 @@ if (!gotLock) {
   });
   app.whenReady().then(() => {
     if (process.platform === 'win32') app.setAppUserModelId('local.zapret.gui');
+    syncGameFilterFile(); // держим файл-флаг в utils/ в актуальном состоянии сразу при старте GUI
     createWindow();
     createTray();
     if (config.autostartWinws) setTimeout(() => startWinws(), 800);
