@@ -82,6 +82,7 @@ const CUSTOM_HOSTS_LINES = [
 let mainWindow = null;
 let tray = null;
 let winwsProcess = null;
+let stoppingIntentionally = false;
 let isQuitting = false;
 
 // ---------- paths ----------
@@ -285,7 +286,7 @@ function startWinws() {
     });
     winwsProcess.on('exit', (code) => {
       sendLog(`> winws.exe завершился (код ${code})`);
-      if (code !== 0 && code !== null) notify('error', `winws.exe неожиданно завершился (код ${code}).`);
+      if (code !== 0 && code !== null && !stoppingIntentionally) notify('error', `winws.exe неожиданно завершился (код ${code}).`);
       winwsProcess = null;
       pushState();
     });
@@ -293,10 +294,12 @@ function startWinws() {
   });
 }
 function stopWinws(cb) {
+  stoppingIntentionally = true;
   const finish = () => {
     winwsProcess = null;
     if (cb) cb();
     pushState();
+    stoppingIntentionally = false;
   };
   if (winwsProcess && winwsProcess.pid) {
     exec(`taskkill /PID ${winwsProcess.pid} /T /F`, () => finish());
