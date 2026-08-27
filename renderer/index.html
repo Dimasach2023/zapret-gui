@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+<title>Zapret GUI</title>
+<link rel="icon" href="icon.png" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <img class="brand-logo" src="icon.png" alt="Zapret GUI" />
+        <span class="brand-name">Zapret GUI</span>
+      </div>
+      <div class="status" id="status">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">проверка…</span>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="main">Главное</button>
+      <button class="tab" data-tab="advanced">Расширенные</button>
+      <button class="tab" data-tab="lists">Списки</button>
+    </nav>
+
+    <main class="content">
+
+      <section class="tab-panel" data-panel="main">
+        <div class="card">
+          <div class="card-title">Стратегия</div>
+          <div class="row">
+            <select id="strategySelect"></select>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Фильтр игр (Game Filter)</div>
+          <div class="row segmented" id="gameFilter">
+            <button class="seg" data-mode="off">Выкл</button>
+            <button class="seg" data-mode="tcp">TCP</button>
+            <button class="seg" data-mode="udp">UDP</button>
+            <button class="seg" data-mode="all">TCP+UDP</button>
+          </div>
+        </div>
+
+        <div class="card controls">
+          <button id="btnStart" class="btn primary big"><img class="btn-icon" src="icon.png"/> Запустить</button>
+          <button id="btnStop" class="btn danger big">■ Остановить</button>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Автозапуск</div>
+          <label class="checkbox">
+            <input type="checkbox" id="chkAutostartApp" />
+            Запускать Zapret GUI при входе в Windows
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="chkAutostartWinws" />
+            Автоматически запускать выбранную стратегию при старте приложения
+          </label>
+        </div>
+
+        <div class="card log-card">
+          <div class="card-title row-between">
+            <span>Журнал</span>
+            <button id="btnClearLog" class="btn ghost small">Очистить</button>
+          </div>
+          <pre id="log" class="log"></pre>
+        </div>
+      </section>
+
+      <section class="tab-panel hidden" data-panel="advanced">
+
+        <div class="card">
+          <div class="card-title">Служба Windows</div>
+          <div class="row-between info-row">
+            <span>Служба «zapret»: <b id="svcState">—</b></span>
+            <span>Драйвер WinDivert: <b id="wdState">—</b></span>
+          </div>
+          <div class="row">
+            <button id="btnSvcInstall" class="btn secondary">Установить как службу</button>
+            <button id="btnSvcRemove" class="btn ghost">Удалить службу</button>
+          </div>
+          <div class="hint">Служба запускает выбранную сейчас стратегию автоматически при загрузке Windows, независимо от GUI.</div>
+        </div>
+
+        <div class="card">
+          <div class="card-title row-between">
+            <span>IPSet Filter</span>
+            <span class="pill" id="ipsetPill">—</span>
+          </div>
+          <div class="row">
+            <button id="btnIpsetCycle" class="btn secondary">Переключить (loaded → none → any)</button>
+            <button id="btnUpdateIpset" class="btn ghost">Обновить список из репозитория</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Обновления</div>
+          <label class="checkbox">
+            <input type="checkbox" id="chkAutoUpdateCheck" />
+            Проверять обновления при запуске
+          </label>
+          <div class="row">
+            <button id="btnCheckUpdates" class="btn secondary">Проверить обновления сейчас</button>
+            <button id="btnUpdateHosts" class="btn ghost">Обновить hosts-файл</button>
+          </div>
+          <div class="hint" id="versionHint"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title row-between">
+            <span>Дополнение hosts от разработчика GUI</span>
+            <span class="pill" id="customHostsPill">—</span>
+          </div>
+          <div class="hint">
+            Добавляет в системный hosts альтернативные IP для WhatsApp, Facebook, Instagram и Roblox (tr.rbxcdn.com) —
+            может помочь, если основные адреса заблокированы у вашего провайдера. Требуются права администратора.
+          </div>
+          <div class="row">
+            <button id="btnUseCustomHosts" class="btn secondary">Использовать дополнение hosts</button>
+            <button id="btnRemoveCustomHosts" class="btn ghost">Убрать дополнение hosts</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Active fake-файлы</div>
+          <div class="row">
+            <label class="mini-label">Discord UDP</label>
+            <select id="fakeDiscordSelect"></select>
+            <button id="btnApplyDiscordFake" class="btn ghost small">Применить</button>
+          </div>
+          <div class="row">
+            <label class="mini-label">Game UDP</label>
+            <select id="fakeGameSelect"></select>
+            <button id="btnApplyGameFake" class="btn ghost small">Применить</button>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="card-title-sm">Автоподбор <span class="badge-new">нет в оригинале</span></div>
+          <div class="hint">
+            По очереди применяет каждый .bin-файл, перезапускает стратегию и проверяет доступность указанного хоста —
+            в конце сама применяет лучший вариант. Это эвристическая проверка (не гарантия обхода блокировки),
+            результат стоит перепроверить в самом Discord/игре.
+          </div>
+          <div class="row">
+            <label class="mini-label">Хост : порт</label>
+            <input type="text" id="probeHost" value="discord.com" />
+            <input type="text" id="probePort" value="443" class="port-input" />
+          </div>
+          <div class="row">
+            <button id="btnAutoPickDiscord" class="btn secondary">Подобрать для Discord UDP</button>
+            <button id="btnAutoPickGame" class="btn secondary">Подобрать для Game UDP</button>
+          </div>
+          <div class="progress-line" id="progressDiscord"></div>
+          <div class="progress-line" id="progressGame"></div>
+        </div>
+
+        <div class="card controls">
+          <button id="btnDiagnostics" class="btn secondary">Запустить диагностику</button>
+          <button id="btnRunTests" class="btn ghost">Запустить тесты стратегий</button>
+        </div>
+      </section>
+
+      <section class="tab-panel hidden" data-panel="lists">
+        <div class="card">
+          <div class="card-title">Редактор списков</div>
+          <div class="row">
+            <select id="listFileSelect"></select>
+            <button id="btnRefreshLists" class="btn ghost small" title="Обновить список файлов">⟳</button>
+          </div>
+          <div class="hint" id="listFileInfo"></div>
+        </div>
+
+        <div class="card list-editor-card">
+          <div class="card-title row-between">
+            <span>Содержимое файла</span>
+            <span id="listDirtyMark" class="pill hidden">не сохранено</span>
+          </div>
+          <textarea id="listEditor" class="list-editor" spellcheck="false" placeholder="Выберите файл списка выше…"></textarea>
+          <div class="row controls">
+            <button id="btnSaveList" class="btn primary">Сохранить</button>
+            <button id="btnReloadList" class="btn ghost">Отменить изменения</button>
+          </div>
+          <div class="hint">
+            При первом сохранении файла рядом автоматически создаётся резервная копия «имя.txt.bak» с исходным содержимым.
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <footer class="footer">
+      <span>Работает только на Windows и требует прав администратора (для драйвера WinDivert).</span>
+      <span class="footer-version" id="footerVersion"></span>
+    </footer>
+  </div>
+
+  <div id="toasts" class="toasts"></div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
