@@ -19,6 +19,7 @@ const TASK_NAME = 'ZapretGUIAutostart';
 const GITHUB_VERSION_URL =
   'https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/.service/version.txt';
 const GITHUB_RELEASES_URL = 'https://github.com/Flowseal/zapret-discord-youtube/releases/latest';
+const GITHUB_API_LATEST_URL = 'https://api.github.com/repos/Flowseal/zapret-discord-youtube/releases/latest';
 const IPSET_URL =
   'https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/refs/heads/main/.service/ipset-service.txt';
 const HOSTS_URL =
@@ -172,6 +173,32 @@ function httpsGetText(url, timeoutMs = 10000) {
       res.setEncoding('utf8');
       res.on('data', (c) => (data += c));
       res.on('end', () => resolve(data));
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+}
+function httpsGetBinary(url, timeoutMs = 60000, onProgress) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'zapret-gui' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        httpsGetBinary(res.headers.location, timeoutMs, onProgress).then(resolve, reject);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        reject(new Error('HTTP ' + res.statusCode));
+        res.resume();
+        return;
+      }
+      const total = parseInt(res.headers['content-length'] || '0', 10);
+      const chunks = [];
+      let received = 0;
+      res.on('data', (chunk) => {
+        chunks.push(chunk);
+        received += chunk.length;
+        if (onProgress && total > 0) onProgress(received, total);
+      });
+      res.on('end', () => resolve(Buffer.concat(chunks)));
     });
     req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
     req.on('error', reject);
@@ -392,17 +419,98 @@ async function checkForUpdates() {
   try {
     const remote = (await httpsGetText(GITHUB_VERSION_URL)).trim();
     if (!remote) throw new Error('пустой ответ');
-    if (remote === LOCAL_VERSION) {
-      sendLog(`> Установлена последняя версия: ${LOCAL_VERSION}`);
-      notify('info', `Установлена последняя версия: ${LOCAL_VERSION}`);
+    const current = config.zapretVersion || LOCAL_VERSION;
+    if (remote === current) {
+      sendLog(`> Установлена последняя версия zapret: ${current}`);
+      notify('info', `Установлена последняя версия: ${current}`);
     } else {
-      sendLog(`> Доступна новая версия: ${remote} (у вас ${LOCAL_VERSION}). Открываю страницу релиза...`);
-      notify('info', `Доступна новая версия: ${remote}. Открываю страницу релиза...`);
-      shell.openExternal(GITHUB_RELEASES_URL);
+      sendLog(`> Доступна новая версия zapret: ${remote} (у вас ${current}). Используйте кнопку «Обновить zapret» для автообновления.`);
+      notify('info', `Доступна новая версия: ${remote}. Нажмите «Обновить zapret» для автообновления.`);
     }
   } catch (e) {
     sendLog('[WARN] Не удалось проверить обновления: ' + e.message);
     notify('error', 'Не удалось проверить обновления: ' + e.message);
+  }
+}
+
+async function updateZapretFiles() {
+  sendLog('> Получение информации о последнем релизе zapret...');
+  try {
+    // 1. Узнаём последний релиз через GitHub API
+    const releaseJson = await httpsGetText(GITHUB_API_LATEST_URL, 15000);
+    const release = JSON.parse(releaseJson);
+    const remoteVersion = (release.tag_name || '').replace(/^v/i, '').trim();
+    const current = config.zapretVersion || LOCAL_VERSION;
+
+    if (!remoteVersion) throw new Error('не удалось определить версию релиза');
+
+    if (remoteVersion === current) {
+      sendLog(`> zapret уже актуален (версия ${current}).`);
+      notify('info', `zapret уже актуален (${current}).`);
+      return;
+    }
+
+    // 2. Ищем ZIP-архив среди assets релиза
+    const assets = release.assets || [];
+    const zipAsset = assets.find((a) => a.name && a.name.toLowerCase().endsWith('.zip'));
+    if (!zipAsset) throw new Error('ZIP-архив не найден среди assets релиза');
+
+    sendLog(`> Скачивание ${zipAsset.name} (${Math.round(zipAsset.size / 1024)} КБ)...`);
+    const zipBuf = await httpsGetBinary(zipAsset.browser_download_url, 120000, (received, total) => {
+      const pct = Math.round((received / total) * 100);
+      if (pct % 20 === 0) sendLog(`> Загрузка... ${pct}%`);
+    });
+
+    // 3. Распаковываем нужные папки (bin/, lists/, utils/) в ZAPRET_ROOT
+    sendLog('> Распаковка файлов...');
+    const AdmZip = require('adm-zip');
+    const zip = new AdmZip(zipBuf);
+    const entries = zip.getEntries();
+
+    // Определяем корневой префикс внутри ZIP (может быть zapret-discord-youtube-x.y.z/)
+    // Ищем первый entry содержащий bin/, lists/ или utils/
+    const targetDirs = ['bin/', 'lists/', 'utils/'];
+    let zipPrefix = '';
+    for (const entry of entries) {
+      const name = entry.entryName.replace(/\\/g, '/');
+      for (const dir of targetDirs) {
+        const idx = name.indexOf('/' + dir);
+        if (idx !== -1) {
+          zipPrefix = name.slice(0, idx + 1);
+          break;
+        }
+      }
+      if (zipPrefix) break;
+    }
+
+    let extractedCount = 0;
+    for (const entry of entries) {
+      if (entry.isDirectory) continue;
+      const entryName = entry.entryName.replace(/\\/g, '/');
+      // Убираем корневой префикс
+      const relative = zipPrefix ? entryName.slice(zipPrefix.length) : entryName;
+      // Берём только файлы из нужных папок
+      const inTarget = targetDirs.some((dir) => relative.startsWith(dir));
+      if (!inTarget) continue;
+
+      const destPath = path.join(ZAPRET_ROOT, ...relative.split('/'));
+      fs.mkdirSync(path.dirname(destPath), { recursive: true });
+      fs.writeFileSync(destPath, entry.getData());
+      extractedCount++;
+    }
+
+    if (extractedCount === 0) throw new Error('не найдены файлы bin/, lists/, utils/ в ZIP-архиве');
+
+    // 4. Сохраняем новую версию в config — теперь localVersion будет её отражать
+    config.zapretVersion = remoteVersion;
+    saveConfig();
+
+    sendLog(`> zapret успешно обновлён до версии ${remoteVersion} (${extractedCount} файлов).`);
+    notify('success', `zapret обновлён до версии ${remoteVersion}.`);
+    pushState();
+  } catch (e) {
+    sendLog('[ERROR] Не удалось обновить zapret: ' + e.message);
+    notify('error', 'Не удалось обновить zapret: ' + e.message);
   }
 }
 async function updateIpsetList() {
@@ -847,7 +955,7 @@ async function getStateObject() {
     activeFakeGame: config.activeFakeGame,
     serviceState,
     windivertState,
-    localVersion: LOCAL_VERSION,
+    localVersion: config.zapretVersion || LOCAL_VERSION,
   };
 }
 async function pushState() {
@@ -969,6 +1077,7 @@ ipcMain.handle('service-install', () => serviceInstall());
 ipcMain.handle('service-remove', () => serviceRemove());
 ipcMain.handle('ipset-cycle', () => ipsetCycle());
 ipcMain.handle('check-updates', () => checkForUpdates());
+ipcMain.handle('update-zapret-files', () => updateZapretFiles());
 ipcMain.handle('update-ipset', () => updateIpsetList());
 ipcMain.handle('update-hosts', () => updateHostsFile());
 ipcMain.handle('toggle-auto-update-check', (e, enable) => toggleAutoUpdateCheck(enable));

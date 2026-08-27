@@ -173,6 +173,7 @@ bindAsyncButton('btnSvcRemove', () => window.api.serviceRemove());
 bindAsyncButton('btnIpsetCycle', () => window.api.ipsetCycle());
 bindAsyncButton('btnUpdateIpset', () => window.api.updateIpset());
 bindAsyncButton('btnCheckUpdates', () => window.api.checkUpdates());
+bindAsyncButton('btnUpdateZapret', () => window.api.updateZapretFiles());
 bindAsyncButton('btnUpdateHosts', () => window.api.updateHosts());
 chkAutoUpdateCheck.addEventListener('change', (e) => window.api.toggleAutoUpdateCheck(e.target.checked));
 bindAsyncButton('btnApplyDiscordFake', () => window.api.replaceFake('discord', fakeDiscordSelect.value));

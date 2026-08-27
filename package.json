@@ -9,6 +9,9 @@
     "start": "electron .",
     "dist": "electron-builder"
   },
+  "dependencies": {
+    "adm-zip": "^0.5.16"
+  },
   "devDependencies": {
     "electron": "^31.0.0",
     "electron-builder": "^24.13.3"

@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('api', {
   serviceRemove: () => ipcRenderer.invoke('service-remove'),
   ipsetCycle: () => ipcRenderer.invoke('ipset-cycle'),
   checkUpdates: () => ipcRenderer.invoke('check-updates'),
+  updateZapretFiles: () => ipcRenderer.invoke('update-zapret-files'),
   updateIpset: () => ipcRenderer.invoke('update-ipset'),
   updateHosts: () => ipcRenderer.invoke('update-hosts'),
   toggleAutoUpdateCheck: (v) => ipcRenderer.invoke('toggle-auto-update-check', v),
