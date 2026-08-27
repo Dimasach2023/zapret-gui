@@ -43,23 +43,11 @@ zapret-gui/
     icon.png
 ```
 
-## Как собрать
 
-```
-npm install
-npm run dist
-```
 
-В `dist/` появится NSIS-установщик и портативная версия — обе уже содержат папку zapret внутри (`resources/zapret`), пользователю ничего указывать не нужно.
 
-Для разработки:
-```
-npm start
-```
-(в dev-режиме приложение берёт файлы из `vendor/zapret/`).
 
 ## Важно
 
 - Работает только на Windows.
 - Приложение запрашивает права администратора автоматически (`requestedExecutionLevel: requireAdministrator`) — это нужно для драйвера WinDivert.
-- Если позже выйдет новая версия zapret-discord-youtube, обновите содержимое `vendor/zapret/bin` и `vendor/zapret/lists`, а также перегенерируйте `strategies.json` из новых `.bat`-файлов (или обновите его вручную).
