@@ -367,10 +367,28 @@ async function serviceRemove() {
   pushState();
 }
 async function queryServiceState(name) {
-  const res = await run(`sc query "${name}"`);
-  if (res.code !== 0) return 'NOT_INSTALLED';
-  const m = res.stdout.match(/STATE\s*:\s*\d+\s*(\w+)/i);
-  return m ? m[1].toUpperCase() : 'UNKNOWN';
+  // ВАЖНО: не парсим вывод "sc query" — на нелокализованной под English Windows
+  // (например, русской) названия полей и статусов там локализованы
+  // ("СОСТОЯНИЕ", "ВЫПОЛНЯЕТСЯ" и т.д.), из-за чего regex по английским словам
+  // никогда не совпадал и статус всегда показывался как "неизвестно".
+  // PowerShell Get-Service возвращает значение enum ServiceControllerStatus,
+  // которое не локализуется и всегда приходит в виде английских констант.
+  const psCmd =
+    `$s = Get-Service -Name '${name.replace(/'/g, "''")}' -ErrorAction SilentlyContinue; ` +
+    `if ($s) { $s.Status.ToString() } else { 'NOT_INSTALLED' }`;
+  const res = await run(`powershell -NoProfile -NonInteractive -Command "${psCmd.replace(/"/g, '\\"')}"`);
+  const out = (res.stdout || '').trim().toUpperCase();
+  if (!out || out === 'NOT_INSTALLED') return 'NOT_INSTALLED';
+  const map = {
+    RUNNING: 'RUNNING',
+    STOPPED: 'STOPPED',
+    STARTPENDING: 'START_PENDING',
+    STOPPENDING: 'STOP_PENDING',
+    CONTINUEPENDING: 'CONTINUE_PENDING',
+    PAUSEPENDING: 'PAUSE_PENDING',
+    PAUSED: 'PAUSED',
+  };
+  return map[out] || 'UNKNOWN';
 }
 
 // ---------- IPSet Filter (loaded / none / any) — заменяет пункт 5 меню ----------

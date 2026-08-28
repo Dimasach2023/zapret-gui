@@ -78,6 +78,9 @@ const SERVICE_LABELS = {
   UNKNOWN: 'неизвестно',
   START_PENDING: 'запускается',
   STOP_PENDING: 'останавливается',
+  CONTINUE_PENDING: 'возобновляется',
+  PAUSE_PENDING: 'приостанавливается',
+  PAUSED: 'приостановлена',
 };
 
 function renderState(state) {
