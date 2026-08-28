@@ -13,6 +13,16 @@ const versionHintEl = document.getElementById('versionHint');
 const fakeDiscordSelect = document.getElementById('fakeDiscordSelect');
 const fakeGameSelect = document.getElementById('fakeGameSelect');
 const customHostsPillEl = document.getElementById('customHostsPill');
+const tgwsPillEl = document.getElementById('tgwsPill');
+const chkTgwsAutostart = document.getElementById('chkTgwsAutostart');
+const chkTgwsWinStartup = document.getElementById('chkTgwsWinStartup');
+const tgwsHostEl = document.getElementById('tgwsHost');
+const tgwsPortEl = document.getElementById('tgwsPort');
+const tgwsSecretEl = document.getElementById('tgwsSecret');
+const tgwsFakeTlsEl = document.getElementById('tgwsFakeTls');
+const chkTgwsNoCfproxy = document.getElementById('chkTgwsNoCfproxy');
+const tgwsLinkEl = document.getElementById('tgwsLink');
+let tgwsSettingsLoaded = false;
 
 let strategiesLoaded = false;
 let binFilesLoaded = false;
@@ -146,6 +156,28 @@ function renderState(state) {
     }
     binFilesLoaded = true;
   }
+
+  if (state.tgws) {
+    const t = state.tgws;
+    tgwsPillEl.textContent = t.running ? (t.managedByUs ? 'работает' : 'работает (вне GUI)') : (t.installed ? 'остановлен' : 'не собран');
+    tgwsPillEl.className = 'pill ' + (t.running ? 'loaded' : t.installed ? 'notapplied' : 'any');
+    document.getElementById('btnTgwsStart').disabled = t.running;
+    document.getElementById('btnTgwsStop').disabled = !t.running;
+    chkTgwsAutostart.checked = !!t.autostart;
+    chkTgwsWinStartup.checked = !!t.winStartup;
+    tgwsLinkEl.value = t.link || '';
+    // поля настроек заполняем один раз, чтобы не затирать то, что человек сейчас печатает
+    if (!tgwsSettingsLoaded) {
+      tgwsHostEl.value = t.host || '127.0.0.1';
+      tgwsPortEl.value = t.port || 1443;
+      tgwsSecretEl.value = t.secret || '';
+      tgwsFakeTlsEl.value = t.fakeTlsDomain || '';
+      chkTgwsNoCfproxy.checked = !!t.noCfproxy;
+      tgwsSettingsLoaded = true;
+    } else {
+      tgwsSecretEl.value = t.secret || '';
+    }
+  }
 }
 
 function appendLog(line) {
@@ -189,9 +221,38 @@ bindAsyncButton('btnAutoPickGame', async () => {
   if (res && res.file) fakeGameSelect.value = res.file;
 });
 bindAsyncButton('btnDiagnostics', () => window.api.runDiagnostics());
-bindAsyncButton('btnRunTests', () => window.api.runTests());
+bindAsyncButton('btnRunTests', async () => {
+  document.getElementById('strategyTestResults').innerHTML = '';
+  const results = await window.api.runTests();
+  renderStrategyTestResults(results);
+});
 bindAsyncButton('btnUseCustomHosts', () => window.api.toggleCustomHosts(true));
 bindAsyncButton('btnRemoveCustomHosts', () => window.api.toggleCustomHosts(false));
+
+// ---------- Telegram (tg-ws-proxy) tab ----------
+bindAsyncButton('btnTgwsStart', () => window.api.tgwsStart());
+bindAsyncButton('btnTgwsStop', () => window.api.tgwsStop());
+chkTgwsAutostart.addEventListener('change', (e) => window.api.tgwsToggleAutostart(e.target.checked));
+chkTgwsWinStartup.addEventListener('change', (e) => window.api.tgwsToggleWinStartup(e.target.checked));
+bindAsyncButton('btnTgwsSaveConfig', () =>
+  window.api.tgwsSetConfig({
+    host: tgwsHostEl.value,
+    port: tgwsPortEl.value,
+    fakeTlsDomain: tgwsFakeTlsEl.value,
+    noCfproxy: chkTgwsNoCfproxy.checked,
+  })
+);
+bindAsyncButton('btnTgwsRegenSecret', () => window.api.tgwsRegenerateSecret());
+document.getElementById('btnTgwsCopySecret').addEventListener('click', () => {
+  if (tgwsSecretEl.value) window.api.copyText(tgwsSecretEl.value);
+  showToast({ type: 'info', text: 'Секрет скопирован.' });
+});
+document.getElementById('btnTgwsCopyLink').addEventListener('click', () => {
+  if (!tgwsLinkEl.value) return;
+  window.api.copyText(tgwsLinkEl.value);
+  showToast({ type: 'info', text: 'Ссылка скопирована.' });
+});
+bindAsyncButton('btnTgwsOpenLink', () => window.api.tgwsOpenLink());
 
 window.api.onState(renderState);
 window.api.onLog(appendLog);
@@ -203,6 +264,41 @@ window.api.onAutoPickProgress(({ slot, index, total, file, status, ms }) => {
   if (status === 'testing') el.textContent = `Тестирую ${index}/${total}: ${file}...`;
   else if (status === 'ok') el.textContent = `✓ ${index}/${total}: ${file} — ${ms} мс`;
   else if (status === 'fail') el.textContent = `✕ ${index}/${total}: ${file} — недоступно`;
+});
+
+function renderStrategyTestResults(results) {
+  const el = document.getElementById('strategyTestResults');
+  if (!el) return;
+  if (!results || results.length === 0) {
+    el.innerHTML = '';
+    return;
+  }
+  const bestScore = results[0].ok;
+  const rows = results
+    .map(
+      (r) => `
+      <tr class="${r.ok === bestScore && bestScore > 0 ? 'best' : ''}" data-strategy-id="${r.id.replace(/"/g, '&quot;')}">
+        <td>${r.name}</td>
+        <td class="score">${r.ok}/${r.total}</td>
+      </tr>`
+    )
+    .join('');
+  el.innerHTML = `<table><tbody>${rows}</tbody></table>`;
+  el.querySelectorAll('tr[data-strategy-id]').forEach((row) => {
+    row.addEventListener('click', () => {
+      window.api.selectStrategy(row.dataset.strategyId).then(renderState);
+      showToast({ type: 'info', text: `Выбрана стратегия: ${row.querySelector('td').textContent}` });
+    });
+  });
+}
+window.api.onStrategyTestProgress(({ index, total, name, status, ok, targetsTotal }) => {
+  const el = document.getElementById('progressStrategyTest');
+  if (!el) return;
+  el.className = 'progress-line' + (status === 'done' && ok === 0 ? ' fail' : status === 'done' && ok === targetsTotal ? ' ok' : '');
+  if (status === 'start') el.textContent = `Подготовка теста ${total} стратегий...`;
+  else if (status === 'testing') el.textContent = `Тестирую ${index}/${total}: ${name}...`;
+  else if (status === 'done') el.textContent = `${index}/${total}: ${name} — ${ok}/${targetsTotal}`;
+  else if (status === 'finished') el.textContent = `Готово: проверено ${total} стратегий.`;
 });
 
 window.api.requestState().then(renderState);

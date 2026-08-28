@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('api', {
   autoPickFake: (slot, host, port) => ipcRenderer.invoke('auto-pick-fake', { slot, host, port }),
   runDiagnostics: () => ipcRenderer.invoke('run-diagnostics'),
   runTests: () => ipcRenderer.invoke('run-tests'),
+  runTestsExternal: () => ipcRenderer.invoke('run-tests-external'),
 
   toggleCustomHosts: (v) => ipcRenderer.invoke('toggle-custom-hosts', v),
   listLists: () => ipcRenderer.invoke('list-lists'),
@@ -31,4 +32,15 @@ contextBridge.exposeInMainWorld('api', {
   onLog: (cb) => ipcRenderer.on('log-line', (e, line) => cb(line)),
   onNotify: (cb) => ipcRenderer.on('notify', (e, payload) => cb(payload)),
   onAutoPickProgress: (cb) => ipcRenderer.on('auto-pick-progress', (e, payload) => cb(payload)),
+  onStrategyTestProgress: (cb) => ipcRenderer.on('strategy-test-progress', (e, payload) => cb(payload)),
+
+  // tg-ws-proxy (Telegram)
+  tgwsStart: () => ipcRenderer.invoke('tgws-start'),
+  tgwsStop: () => ipcRenderer.invoke('tgws-stop'),
+  tgwsSetConfig: (cfg) => ipcRenderer.invoke('tgws-set-config', cfg),
+  tgwsRegenerateSecret: () => ipcRenderer.invoke('tgws-regenerate-secret'),
+  tgwsToggleAutostart: (v) => ipcRenderer.invoke('tgws-toggle-autostart', v),
+  tgwsToggleWinStartup: (v) => ipcRenderer.invoke('tgws-toggle-win-startup', v),
+  tgwsOpenLink: () => ipcRenderer.invoke('tgws-open-link'),
+  copyText: (text) => ipcRenderer.invoke('copy-text', text),
 });

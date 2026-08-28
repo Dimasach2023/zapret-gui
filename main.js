@@ -4,18 +4,20 @@
 // замена active fake-файлов, диагностика, тесты. Папка zapret зашита в приложение
 // (resources/zapret), выбирать её не нужно.
 
-const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, shell, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
 const { spawn, exec } = require('child_process');
 const net = require('net');
 const tls = require('tls');
+const crypto = require('crypto');
 
 const isWin = process.platform === 'win32';
 const LOCAL_VERSION = '1.10.2';
 const SERVICE_NAME = 'zapret';
 const TASK_NAME = 'ZapretGUIAutostart';
+const TGWS_TASK_NAME = 'ZapretTgwsProxyAutostart';
 const GITHUB_VERSION_URL =
   'https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/.service/version.txt';
 const GITHUB_RELEASES_URL = 'https://github.com/Flowseal/zapret-discord-youtube/releases/latest';
@@ -84,6 +86,8 @@ let tray = null;
 let winwsProcess = null;
 let stoppingIntentionally = false;
 let isQuitting = false;
+let tgwsProcess = null;
+let stoppingTgwsIntentionally = false;
 
 // ---------- paths ----------
 const ZAPRET_ROOT = app.isPackaged
@@ -93,6 +97,19 @@ const BIN_DIR = path.join(ZAPRET_ROOT, 'bin');
 const LISTS_DIR = path.join(ZAPRET_ROOT, 'lists');
 const UTILS_DIR = path.join(ZAPRET_ROOT, 'utils');
 const WINWS_EXE = path.join(BIN_DIR, 'winws.exe');
+// tg-ws-proxy (Telegram MTProto/WebSocket proxy) — второй управляемый процесс,
+// вынесен в свою папку рядом с zapret, по той же схеме «портативный exe внутри приложения»
+const TGWS_ROOT = app.isPackaged
+  ? path.join(process.resourcesPath, 'tg-ws-proxy')
+  : path.join(__dirname, 'vendor', 'tg-ws-proxy');
+const TGWS_BIN_DIR = path.join(TGWS_ROOT, 'bin');
+const TGWS_EXE = path.join(TGWS_BIN_DIR, 'tg-ws-proxy.exe');
+// Скрытая обёртка для запуска tg-ws-proxy.exe из Task Scheduler: сам exe консольный
+// (console=True в pyinstaller-спеке), поэтому при прямом запуске из планировщика
+// Windows показывает его окно консоли — windowsHide в spawn() тут не действует,
+// он применяется только когда процесс запускает сам Electron. VBS-обёртка с
+// WScript.Shell.Run(..., 0) запускает процесс полностью скрыто в любом случае.
+const TGWS_STARTUP_VBS = path.join(app.getPath('userData'), 'tgws-startup.vbs');
 const IPSET_ALL = path.join(LISTS_DIR, 'ipset-all.txt');
 const IPSET_BACKUP = IPSET_ALL + '.backup';
 const CHECK_UPDATES_FLAG = path.join(UTILS_DIR, 'check_updates.enabled');
@@ -130,6 +147,14 @@ let config = Object.assign(
     // после каждого перезапуска GUI, даже если сам файл оставался применённым.
     activeFakeDiscord: 'ACTIVE_DISCORD_UDP.bin',
     activeFakeGame: 'ACTIVE_GAME_UDP.bin',
+    // ---- tg-ws-proxy (Telegram) ----
+    tgwsAutostart: false, // запускать вместе с приложением
+    tgwsWinStartup: false, // запускать при входе в Windows (Task Scheduler)
+    tgwsHost: '127.0.0.1',
+    tgwsPort: 1443,
+    tgwsSecret: '', // 32 hex-символа; если пусто — сгенерируется автоматически при первом запуске
+    tgwsFakeTlsDomain: '',
+    tgwsNoCfproxy: false,
   },
   loadConfigFile()
 );
@@ -314,6 +339,105 @@ function checkWinwsRunning() {
     if (!isWin) return resolve(false);
     exec('tasklist /FI "IMAGENAME eq winws.exe" /NH /FO CSV', (err, stdout) => {
       resolve(!err && /winws\.exe/i.test(stdout));
+    });
+  });
+}
+
+// ---------- tg-ws-proxy (Telegram MTProto/WebSocket proxy) ----------
+// Управляется точно так же, как winws.exe: отдельный дочерний процесс,
+// свой набор CLI-аргументов, свой статус в getStateObject(). Секрет (32 hex)
+// генерируется один раз и хранится в config.json, чтобы ссылка tg://proxy
+// не менялась при каждом перезапуске.
+function ensureTgwsSecret() {
+  if (!/^[0-9a-fA-F]{32}$/.test(config.tgwsSecret || '')) {
+    config.tgwsSecret = crypto.randomBytes(16).toString('hex');
+    saveConfig();
+  }
+  return config.tgwsSecret;
+}
+function buildTgwsArgs() {
+  const args = [
+    '--host', config.tgwsHost || '127.0.0.1',
+    '--port', String(config.tgwsPort || 1443),
+    '--secret', ensureTgwsSecret(),
+  ];
+  if (config.tgwsFakeTlsDomain) args.push('--fake-tls-domain', config.tgwsFakeTlsDomain);
+  if (config.tgwsNoCfproxy) args.push('--no-cfproxy');
+  return args;
+}
+function buildTgLink() {
+  const secret = config.tgwsSecret;
+  if (!secret) return '';
+  // 0.0.0.0 слушает на всех интерфейсах — для ссылки это не адрес назначения,
+  // поэтому подставляем localhost; для доступа извне (друзьям) нужно вручную
+  // указать внешний IP/домен — GUI не может надёжно определить его сам.
+  const host = config.tgwsHost && config.tgwsHost !== '0.0.0.0' ? config.tgwsHost : '127.0.0.1';
+  return `tg://proxy?server=${encodeURIComponent(host)}&port=${config.tgwsPort || 1443}&secret=${secret}`;
+}
+function startTgws() {
+  if (!isWin) {
+    sendLog('[ERROR] tg-ws-proxy.exe запускается только на Windows.');
+    notify('error', 'tg-ws-proxy.exe запускается только на Windows.');
+    return;
+  }
+  if (!fs.existsSync(TGWS_EXE)) {
+    sendLog('[ERROR] Не найден tg-ws-proxy\\bin\\tg-ws-proxy.exe внутри приложения.');
+    notify('error', 'Не найден tg-ws-proxy\\bin\\tg-ws-proxy.exe. См. инструкцию по сборке в vendor/tg-ws-proxy/README.md.');
+    return;
+  }
+  stopTgws(() => {
+    const args = buildTgwsArgs();
+    sendLog(`> Запуск Telegram-прокси на ${config.tgwsHost}:${config.tgwsPort}...`);
+    try {
+      tgwsProcess = spawn(TGWS_EXE, args, { cwd: TGWS_BIN_DIR, windowsHide: true });
+    } catch (e) {
+      sendLog('[ERROR] Не удалось запустить tg-ws-proxy.exe: ' + e.message);
+      notify('error', 'Не удалось запустить tg-ws-proxy.exe: ' + e.message);
+      tgwsProcess = null;
+      pushState();
+      return;
+    }
+    notify('success', 'Telegram-прокси запущен.');
+    tgwsProcess.stdout.on('data', (d) => sendLog('[TG] ' + d.toString('utf8')));
+    tgwsProcess.stderr.on('data', (d) => sendLog('[TG] ' + d.toString('utf8')));
+    tgwsProcess.on('error', (e) => {
+      sendLog('[TG][ERROR] ' + e.message);
+      notify('error', 'tg-ws-proxy: ' + e.message);
+      tgwsProcess = null;
+      pushState();
+    });
+    tgwsProcess.on('exit', (code) => {
+      sendLog(`> tg-ws-proxy.exe завершился (код ${code})`);
+      if (code !== 0 && code !== null && !stoppingTgwsIntentionally) {
+        notify('error', `tg-ws-proxy.exe неожиданно завершился (код ${code}).`);
+      }
+      tgwsProcess = null;
+      pushState();
+    });
+    pushState();
+  });
+}
+function stopTgws(cb) {
+  stoppingTgwsIntentionally = true;
+  const finish = () => {
+    tgwsProcess = null;
+    if (cb) cb();
+    pushState();
+    stoppingTgwsIntentionally = false;
+  };
+  if (tgwsProcess && tgwsProcess.pid) {
+    exec(`taskkill /PID ${tgwsProcess.pid} /T /F`, () => finish());
+  } else if (isWin) {
+    exec('taskkill /IM tg-ws-proxy.exe /F', () => finish());
+  } else {
+    finish();
+  }
+}
+function checkTgwsRunning() {
+  return new Promise((resolve) => {
+    if (!isWin) return resolve(false);
+    exec('tasklist /FI "IMAGENAME eq tg-ws-proxy.exe" /NH /FO CSV', (err, stdout) => {
+      resolve(!err && /tg-ws-proxy\.exe/i.test(stdout));
     });
   });
 }
@@ -938,6 +1062,100 @@ function runTests() {
   exec(`start "" powershell -NoProfile -ExecutionPolicy Bypass -File "${script}"`, { cwd: ZAPRET_ROOT });
 }
 
+// ---------- Тест стратегий прямо в приложении (без внешнего окна PowerShell) ----------
+// В отличие от utils\test zapret.ps1 (который ищет general*.bat в корне zapret —
+// а в этой сборке стратегии хранятся не в .bat, а в strategies.json), тестер ниже
+// перебирает стратегии из strategies.json напрямую: по очереди запускает winws.exe
+// с аргументами каждой стратегии и проверяет TLS-доступность набора целевых хостов
+// (той же функцией probeHost, что и в автоподборе fake-файлов).
+const STRATEGY_TEST_TARGETS = [
+  { name: 'Discord Main', host: 'discord.com' },
+  { name: 'Discord Gateway', host: 'gateway.discord.gg' },
+  { name: 'Discord CDN', host: 'cdn.discordapp.com' },
+  { name: 'YouTube', host: 'www.youtube.com' },
+  { name: 'YouTube Redirect', host: 'redirector.googlevideo.com' },
+  { name: 'Google', host: 'www.google.com' },
+];
+let strategyTestRunning = false;
+function sendStrategyTestProgress(payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('strategy-test-progress', payload);
+}
+async function runStrategyTestsInline() {
+  if (strategyTestRunning) {
+    sendLog('[WARN] Тест стратегий уже выполняется.');
+    return null;
+  }
+  if (!isWin) {
+    sendLog('[ERROR] Тест стратегий доступен только на Windows.');
+    notify('error', 'Тест стратегий доступен только на Windows.');
+    return null;
+  }
+  if (!fs.existsSync(WINWS_EXE)) {
+    sendLog('[ERROR] Не найден bin\\winws.exe внутри приложения.');
+    notify('error', 'Не найден bin\\winws.exe внутри приложения.');
+    return null;
+  }
+  const svc = await queryServiceState(SERVICE_NAME);
+  if (svc === 'RUNNING') {
+    sendLog('[WARN] Служба "zapret" установлена и работает — она может мешать тесту (перезапускать winws параллельно). Рекомендуется сначала удалить службу.');
+  }
+
+  strategyTestRunning = true;
+  const originalStrategyId = config.strategyId;
+  const wasManagedByUs = !!winwsProcess;
+  const total = strategies.length;
+  sendLog(`> === Тест стратегий (в приложении): ${total} шт., ${STRATEGY_TEST_TARGETS.length} целей на каждую ===`);
+  notify('info', `Запущен тест ${total} стратегий — это может занять пару минут.`);
+  sendStrategyTestProgress({ index: 0, total, name: '', status: 'start' });
+
+  const results = [];
+  try {
+    for (let i = 0; i < strategies.length; i++) {
+      const s = strategies[i];
+      sendStrategyTestProgress({ index: i + 1, total, name: s.name, status: 'testing' });
+      config.strategyId = s.id; // не сохраняем в config.json — это только для теста
+      startWinws();
+      await delay(1800); // дать winws/драйверу подняться
+      const perTarget = await Promise.all(
+        STRATEGY_TEST_TARGETS.map(async (t) => {
+          const res = await probeHost(t.host, 443, 4000);
+          return { name: t.name, ok: res.ok, ms: res.ms };
+        })
+      );
+      const ok = perTarget.filter((r) => r.ok).length;
+      results.push({ id: s.id, name: s.name, ok, total: STRATEGY_TEST_TARGETS.length, perTarget });
+      sendLog(`  [${ok}/${STRATEGY_TEST_TARGETS.length}] ${s.name}`);
+      sendStrategyTestProgress({ index: i + 1, total, name: s.name, status: 'done', ok, targetsTotal: STRATEGY_TEST_TARGETS.length });
+    }
+  } catch (e) {
+    sendLog('[ERROR] Тест стратегий прерван: ' + e.message);
+  } finally {
+    config.strategyId = originalStrategyId;
+    if (wasManagedByUs) {
+      startWinws();
+    } else {
+      stopWinws();
+    }
+    strategyTestRunning = false;
+    pushState();
+  }
+
+  const sorted = [...results].sort((a, b) => b.ok - a.ok);
+  sendLog('> === Тест стратегий завершён ===');
+  const best = sorted[0];
+  if (best && best.ok > 0) {
+    sendLog(`> Лучший результат: «${best.name}» (${best.ok}/${best.total}).`);
+    notify('success', `Тест завершён. Лучшая стратегия: «${best.name}» (${best.ok}/${best.total}).`);
+  } else {
+    sendLog('> Ни одна стратегия не прошла проверку целей.');
+    notify('error', 'Тест завершён — ни одна стратегия не прошла проверку.');
+  }
+  sendLog('  Учтите: это эвристическая проверка доступности хостов, а не гарантия обхода блокировки в Discord/игре/браузере.');
+  sendStrategyTestProgress({ index: total, total, name: '', status: 'finished', results: sorted });
+  return sorted;
+}
+
 // ---------- autostart app (Task Scheduler, без UAC при каждом входе) ----------
 function setAutostartApp(enable) {
   if (!isWin) return;
@@ -953,9 +1171,55 @@ function setAutostartApp(enable) {
   }
 }
 
+// ---------- autostart tg-ws-proxy (Task Scheduler, без UAC) ----------
+// Экранирование строки для встраивания в двойные кавычки VBScript (" -> "").
+function vbsQuote(str) {
+  return '"' + String(str).replace(/"/g, '""') + '"';
+}
+
+function setTgwsWinStartup(enable) {
+  if (!isWin) return;
+  if (enable) {
+    const args = buildTgwsArgs(); // те же аргументы что при ручном запуске
+    // Собираем командную строку одним аргументом для WshShell.Run, чтобы пути и
+    // значения с пробелами (например --fake-tls-domain) оставались отдельными
+    // аргументами процесса: каждый токен в двойных кавычках, вся команда —
+    // одна VBScript-строка (кавычки внутри неё удваиваются).
+    const cmdLine = [TGWS_EXE, ...args].map((a) => `"${a}"`).join(' ');
+    const vbsContent =
+      'Set WshShell = CreateObject("WScript.Shell")\r\n' +
+      `WshShell.Run ${vbsQuote(cmdLine)}, 0, False\r\n`;
+    try {
+      fs.writeFileSync(TGWS_STARTUP_VBS, vbsContent, 'utf-8');
+    } catch (e) {
+      sendLog('[WARN] Не удалось создать обёртку автозапуска tg-ws-proxy: ' + e.message);
+      return;
+    }
+    // Запускаем exe не напрямую, а через wscript.exe + .vbs-обёртку: она вызывает
+    // процесс со стилем окна 0 (полностью скрыто), тогда как прямой запуск
+    // консольного tg-ws-proxy.exe из Task Scheduler показывает окно консоли.
+    exec(
+      `schtasks /Create /TN "${TGWS_TASK_NAME}" /TR "wscript.exe \\"${TGWS_STARTUP_VBS}\\"" /SC ONLOGON /RL HIGHEST /F`,
+      (err) => {
+        sendLog(err ? '[WARN] Не удалось создать автозапуск tg-ws-proxy: ' + err.message : '> Автозапуск tg-ws-proxy при входе в Windows включён.');
+      }
+    );
+  } else {
+    exec(`schtasks /Delete /TN "${TGWS_TASK_NAME}" /F`, (err) => {
+      if (!err) sendLog('> Автозапуск tg-ws-proxy при входе в Windows выключен.');
+      try {
+        fs.unlinkSync(TGWS_STARTUP_VBS);
+      } catch (_) {
+        // файла может не быть — не страшно
+      }
+    });
+  }
+}
+
 // ---------- state broadcast ----------
 async function getStateObject() {
   const runningNow = await checkWinwsRunning();
+  const tgwsRunningNow = await checkTgwsRunning();
   let serviceState = 'NOT_INSTALLED';
   let windivertState = 'NOT_INSTALLED';
   if (isWin) {
@@ -979,6 +1243,19 @@ async function getStateObject() {
     serviceState,
     windivertState,
     localVersion: config.zapretVersion || LOCAL_VERSION,
+    tgws: {
+      installed: fs.existsSync(TGWS_EXE),
+      running: !!tgwsProcess || tgwsRunningNow,
+      managedByUs: !!tgwsProcess,
+      autostart: config.tgwsAutostart,
+      winStartup: config.tgwsWinStartup,
+      host: config.tgwsHost,
+      port: config.tgwsPort,
+      secret: config.tgwsSecret,
+      fakeTlsDomain: config.tgwsFakeTlsDomain,
+      noCfproxy: config.tgwsNoCfproxy,
+      link: buildTgLink(),
+    },
   };
 }
 async function pushState() {
@@ -1015,10 +1292,15 @@ function createWindow() {
 }
 function updateTrayMenu(running) {
   if (!tray) return;
+  const tgwsRunning = !!tgwsProcess;
   const menu = Menu.buildFromTemplate([
     { label: 'Открыть Zapret GUI', click: () => mainWindow.show() },
     { type: 'separator' },
     { label: running ? '■ Остановить' : '▶ Запустить', click: () => (running ? stopWinws() : startWinws()) },
+    {
+      label: tgwsRunning ? '■ Остановить Telegram-прокси' : '▶ Запустить Telegram-прокси',
+      click: () => (tgwsRunning ? stopTgws() : startTgws()),
+    },
     { type: 'separator' },
     {
       label: 'Выход',
@@ -1060,6 +1342,7 @@ if (!gotLock) {
     createWindow();
     createTray();
     if (config.autostartWinws) setTimeout(() => startWinws(), 800);
+    if (config.tgwsAutostart) setTimeout(() => startTgws(), 1000);
   });
   app.on('window-all-closed', () => {});
   app.on('before-quit', () => {
@@ -1107,7 +1390,8 @@ ipcMain.handle('toggle-auto-update-check', (e, enable) => toggleAutoUpdateCheck(
 ipcMain.handle('replace-fake', (e, { slot, sourceFile }) => replaceActiveFake(slot, sourceFile));
 ipcMain.handle('auto-pick-fake', (e, { slot, host, port }) => autoPickFake(slot, host, port));
 ipcMain.handle('run-diagnostics', () => runDiagnostics());
-ipcMain.handle('run-tests', () => runTests());
+ipcMain.handle('run-tests', () => runStrategyTestsInline());
+ipcMain.handle('run-tests-external', () => runTests());
 ipcMain.handle('toggle-custom-hosts', (e, enable) => toggleCustomHosts(enable));
 ipcMain.handle('list-lists', () => listEditableFiles());
 ipcMain.handle('read-list', (e, name) => {
@@ -1118,3 +1402,54 @@ ipcMain.handle('read-list', (e, name) => {
   }
 });
 ipcMain.handle('save-list', (e, { name, content }) => saveListFile(name, content));
+
+// ---------- IPC: tg-ws-proxy ----------
+ipcMain.handle('tgws-start', () => startTgws());
+ipcMain.handle('tgws-stop', () => stopTgws(() => notify('info', 'Telegram-прокси остановлен.')));
+ipcMain.handle('tgws-set-config', (e, cfg) => {
+  config.tgwsHost = (cfg.host || '127.0.0.1').trim();
+  const port = parseInt(cfg.port, 10);
+  config.tgwsPort = Number.isFinite(port) && port > 0 && port < 65536 ? port : 1443;
+  config.tgwsFakeTlsDomain = (cfg.fakeTlsDomain || '').trim();
+  config.tgwsNoCfproxy = !!cfg.noCfproxy;
+  saveConfig();
+  const wasRunning = !!tgwsProcess;
+  pushState();
+  if (wasRunning) startTgws();
+  // задача автозапуска хранит аргументы в vbs-обёртке — пересоздаём её,
+  // иначе после смены хоста/порта/домена автозапуск продолжит стартовать
+  // со старыми параметрами
+  if (config.tgwsWinStartup) setTgwsWinStartup(true);
+});
+ipcMain.handle('tgws-regenerate-secret', () => {
+  config.tgwsSecret = crypto.randomBytes(16).toString('hex');
+  saveConfig();
+  const wasRunning = !!tgwsProcess;
+  pushState();
+  if (wasRunning) startTgws();
+  if (config.tgwsWinStartup) setTgwsWinStartup(true);
+});
+ipcMain.handle('tgws-toggle-autostart', (e, enable) => {
+  config.tgwsAutostart = enable;
+  saveConfig();
+  pushState();
+});
+ipcMain.handle('tgws-toggle-win-startup', (e, enable) => {
+  config.tgwsWinStartup = enable;
+  saveConfig();
+  setTgwsWinStartup(enable);
+  pushState();
+});
+ipcMain.handle('copy-text', (e, text) => {
+  clipboard.writeText(text || '');
+  return true;
+});
+ipcMain.handle('tgws-open-link', () => {
+  const link = buildTgLink();
+  if (!link) {
+    notify('error', 'Сначала запустите прокси — секрет ещё не сгенерирован.');
+    return false;
+  }
+  shell.openExternal(link);
+  return true;
+});

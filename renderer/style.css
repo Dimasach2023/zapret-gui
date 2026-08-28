@@ -151,6 +151,13 @@ body {
 
 .row { display: flex; gap: 8px; align-items: center; }
 
+/* stacked rows inside a card had no vertical gap, so a row of buttons
+   (e.g. "Добавить в Telegram") sat flush against the input row above it
+   and visually overlapped/crept onto the field. Give every non-first
+   .row inside a card a bit of breathing room, everywhere this pattern
+   occurs. */
+.card > .row:not(:first-child) { margin-top: 10px; }
+
 input[type="text"], select {
   flex: 1;
   background: var(--panel-2);
@@ -417,6 +424,9 @@ select { cursor: pointer; }
   transition: border-color .15s;
 }
 .list-editor:focus { border-color: var(--accent); }
+.autopick-row { margin-top: 4px; }
+.autopick-btn { flex: 1; justify-content: center; }
+
 .progress-line {
   margin-top: 8px;
   font-size: 12.5px;
@@ -425,6 +435,14 @@ select { cursor: pointer; }
 }
 .progress-line.ok { color: var(--green); }
 .progress-line.fail { color: var(--red); }
+
+.strategy-test-results { margin-top: 6px; }
+.strategy-test-results table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.strategy-test-results td { padding: 3px 6px; border-bottom: 1px solid var(--border, #333); }
+.strategy-test-results tr.best td { color: var(--green); font-weight: 600; }
+.strategy-test-results td.score { text-align: right; white-space: nowrap; }
+.strategy-test-results tr { cursor: pointer; }
+.strategy-test-results tr:hover td { color: var(--accent); }
 
 /* ---------- кастомный скроллбар (вместо дефолтного браузерного) ---------- */
 /* Firefox */

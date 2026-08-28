@@ -23,6 +23,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="main">Главное</button>
       <button class="tab" data-tab="advanced">Расширенные</button>
+      <button class="tab" data-tab="tgws">Telegram</button>
       <button class="tab" data-tab="lists">Списки</button>
     </nav>
 
@@ -153,9 +154,9 @@
             <input type="text" id="probeHost" value="discord.com" />
             <input type="text" id="probePort" value="443" class="port-input" />
           </div>
-          <div class="row">
-            <button id="btnAutoPickDiscord" class="btn secondary">Подобрать для Discord UDP</button>
-            <button id="btnAutoPickGame" class="btn secondary">Подобрать для Game UDP</button>
+          <div class="row autopick-row">
+            <button id="btnAutoPickDiscord" class="btn secondary autopick-btn">Подобрать для Discord UDP</button>
+            <button id="btnAutoPickGame" class="btn secondary autopick-btn">Подобрать для Game UDP</button>
           </div>
           <div class="progress-line" id="progressDiscord"></div>
           <div class="progress-line" id="progressGame"></div>
@@ -164,6 +165,89 @@
         <div class="card controls">
           <button id="btnDiagnostics" class="btn secondary">Запустить диагностику</button>
           <button id="btnRunTests" class="btn ghost">Запустить тесты стратегий</button>
+          <div class="hint">
+            Перебирает все стратегии из strategies.json прямо в приложении (без внешнего окна PowerShell)
+            и проверяет доступность Discord/YouTube/Google по каждой из них.
+          </div>
+          <div class="progress-line" id="progressStrategyTest"></div>
+          <div id="strategyTestResults" class="strategy-test-results"></div>
+        </div>
+      </section>
+
+      <section class="tab-panel hidden" data-panel="tgws">
+        <div class="card">
+          <div class="card-title row-between">
+            <span>Telegram-прокси (tg-ws-proxy)</span>
+            <span class="pill" id="tgwsPill">—</span>
+          </div>
+          <div class="hint">
+            Встроенный MTProto/WebSocket-прокси для Telegram (проект tg-ws-proxy). Работает как
+            отдельный процесс рядом с winws — их можно использовать вместе или по отдельности.
+          </div>
+        </div>
+
+        <div class="card controls">
+          <button id="btnTgwsStart" class="btn primary big">▶ Запустить прокси</button>
+          <button id="btnTgwsStop" class="btn danger big">■ Остановить</button>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Автозапуск</div>
+          <label class="checkbox">
+            <input type="checkbox" id="chkTgwsAutostart" />
+            Запускать Telegram-прокси автоматически при старте приложения
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="chkTgwsWinStartup" />
+            Запускать tg-ws-proxy при входе в Windows (независимо от GUI)
+          </label>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Настройки</div>
+          <div class="row">
+            <label class="mini-label">Host</label>
+            <input type="text" id="tgwsHost" value="127.0.0.1" />
+            <label class="mini-label">Port</label>
+            <input type="text" id="tgwsPort" value="1443" class="port-input" />
+          </div>
+          <div class="row">
+            <label class="mini-label">Secret</label>
+            <input type="text" id="tgwsSecret" readonly />
+            <button id="btnTgwsCopySecret" class="btn ghost small">Копировать</button>
+            <button id="btnTgwsRegenSecret" class="btn ghost small">Новый</button>
+          </div>
+          <div class="row">
+            <label class="mini-label">Fake TLS</label>
+            <input type="text" id="tgwsFakeTls" placeholder="например, www.google.com (необязательно)" />
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" id="chkTgwsNoCfproxy" />
+            Отключить резервный обход через Cloudflare (fallback)
+          </label>
+          <div class="row controls">
+            <button id="btnTgwsSaveConfig" class="btn secondary">Сохранить настройки</button>
+          </div>
+          <div class="hint">
+            Если прокси был запущен, изменения применяются с перезапуском процесса.
+            Секрет — 32 hex-символа; заново сгенерировать можно кнопкой «Новый».
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Ссылка для подключения</div>
+          <div class="row">
+            <input type="text" id="tgwsLink" readonly placeholder="Запустите прокси, чтобы получить ссылку" />
+            <button id="btnTgwsCopyLink" class="btn ghost small">Копировать</button>
+          </div>
+          <div class="row controls">
+            <button id="btnTgwsOpenLink" class="btn primary">Добавить в Telegram</button>
+          </div>
+          <div class="hint">
+            Ссылка вида <code>tg://proxy?server=...&amp;port=...&amp;secret=...</code> — откройте её на устройстве
+            с Telegram, чтобы подключиться. Для доступа с других устройств/друзей замените адрес
+            127.0.0.1 на ваш внешний IP или домен и настройте проброс порта на роутере.
+          </div>
         </div>
       </section>
 

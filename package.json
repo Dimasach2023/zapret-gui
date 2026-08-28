@@ -30,7 +30,8 @@
       "package.json"
     ],
     "extraResources": [
-      { "from": "vendor/zapret", "to": "zapret" }
+      { "from": "vendor/zapret", "to": "zapret" },
+      { "from": "vendor/tg-ws-proxy/bin", "to": "tg-ws-proxy/bin" }
     ],
     "win": {
       "target": [
