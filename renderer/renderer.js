@@ -16,10 +16,6 @@ const customHostsPillEl = document.getElementById('customHostsPill');
 
 let strategiesLoaded = false;
 let binFilesLoaded = false;
-// true, пока пользователь выбрал файл в списке, но ещё не нажал «Применить» —
-// не даём renderState() затереть выбор значением из state при очередном pushState()
-let fakeDiscordDirty = false;
-let fakeGameDirty = false;
 
 // ---------- toast notifications ----------
 const toastsEl = document.getElementById('toasts');
@@ -136,17 +132,16 @@ function renderState(state) {
         sel.appendChild(opt);
       }
     }
-    binFilesLoaded = true;
-  }
-  // выставляем реально применённый файл (хранится в config.json), а не дефолт —
-  // раньше значение всегда сбрасывалось на ACTIVE_*.bin при каждом запуске GUI
-  if (binFilesLoaded) {
-    if (!fakeDiscordDirty && state.activeFakeDiscord && [...fakeDiscordSelect.options].some((o) => o.value === state.activeFakeDiscord)) {
+    // выставляем реально применённый файл (хранится в config.json) ОДИН РАЗ, при первой
+    // загрузке. Дальше это поле больше никогда не трогается автоматически (в т.ч. по
+    // setInterval-опросу раз в 3 сек) — иначе несохранённый выбор пользователя затирается.
+    if (state.activeFakeDiscord && [...fakeDiscordSelect.options].some((o) => o.value === state.activeFakeDiscord)) {
       fakeDiscordSelect.value = state.activeFakeDiscord;
     }
-    if (!fakeGameDirty && state.activeFakeGame && [...fakeGameSelect.options].some((o) => o.value === state.activeFakeGame)) {
+    if (state.activeFakeGame && [...fakeGameSelect.options].some((o) => o.value === state.activeFakeGame)) {
       fakeGameSelect.value = state.activeFakeGame;
     }
+    binFilesLoaded = true;
   }
 }
 
@@ -180,23 +175,15 @@ bindAsyncButton('btnCheckUpdates', () => window.api.checkUpdates());
 bindAsyncButton('btnUpdateZapret', () => window.api.updateZapretFiles());
 bindAsyncButton('btnUpdateHosts', () => window.api.updateHosts());
 chkAutoUpdateCheck.addEventListener('change', (e) => window.api.toggleAutoUpdateCheck(e.target.checked));
-fakeDiscordSelect.addEventListener('change', () => { fakeDiscordDirty = true; });
-fakeGameSelect.addEventListener('change', () => { fakeGameDirty = true; });
-bindAsyncButton('btnApplyDiscordFake', async () => {
-  await window.api.replaceFake('discord', fakeDiscordSelect.value);
-  fakeDiscordDirty = false;
-});
-bindAsyncButton('btnApplyGameFake', async () => {
-  await window.api.replaceFake('game', fakeGameSelect.value);
-  fakeGameDirty = false;
-});
+bindAsyncButton('btnApplyDiscordFake', () => window.api.replaceFake('discord', fakeDiscordSelect.value));
+bindAsyncButton('btnApplyGameFake', () => window.api.replaceFake('game', fakeGameSelect.value));
 bindAsyncButton('btnAutoPickDiscord', async () => {
-  await window.api.autoPickFake('discord', document.getElementById('probeHost').value, document.getElementById('probePort').value);
-  fakeDiscordDirty = false;
+  const res = await window.api.autoPickFake('discord', document.getElementById('probeHost').value, document.getElementById('probePort').value);
+  if (res && res.file) fakeDiscordSelect.value = res.file;
 });
 bindAsyncButton('btnAutoPickGame', async () => {
-  await window.api.autoPickFake('game', document.getElementById('probeHost').value, document.getElementById('probePort').value);
-  fakeGameDirty = false;
+  const res = await window.api.autoPickFake('game', document.getElementById('probeHost').value, document.getElementById('probePort').value);
+  if (res && res.file) fakeGameSelect.value = res.file;
 });
 bindAsyncButton('btnDiagnostics', () => window.api.runDiagnostics());
 bindAsyncButton('btnRunTests', () => window.api.runTests());

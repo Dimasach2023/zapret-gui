@@ -842,6 +842,7 @@ async function autoPickFake(slot, testHost, testPort) {
       startWinws();
       sendLog(`> Лучший результат: ${best.file} (${best.ms} мс). Применён и запущен.`);
       notify('success', `Автоподбор завершён: лучший файл — ${best.file} (${best.ms} мс).`);
+      return { file: best.file };
     } else if (original) {
       fs.writeFileSync(target, original);
       startWinws();
@@ -853,6 +854,7 @@ async function autoPickFake(slot, testHost, testPort) {
     }
     sendLog('> === Автоподбор завершён ===');
     sendLog('  Учтите: это эвристическая проверка доступности хоста, а не гарантия обхода блокировки — итоговый выбор стоит перепроверить в самом приложении (Discord/игра).');
+    return null;
   } finally {
     autoPickRunning[slot] = false;
     pushState();
