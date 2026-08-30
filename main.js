@@ -33,9 +33,20 @@ const ZAPRET_HOSTS_MARK_START = '# === Zapret GUI: hosts от zapret-discord-you
 const ZAPRET_HOSTS_MARK_END = '# === Zapret GUI: hosts от zapret-discord-youtube — конец ===';
 
 // ---------- дополнение hosts от разработчика GUI (WhatsApp/Facebook/Instagram/Roblox) ----------
+// Раньше список был зашит прямо в код (CUSTOM_HOSTS_LINES) — теперь он
+// подтягивается из GitHub-репозитория автора (raw-файл, обычный текст,
+// по строке "IP hostname", пустые строки и строки с "#" игнорируются) и
+// кэшируется в config.json, чтобы работать и без интернета после первой
+// успешной загрузки. URL можно переопределить в настройках GUI
+// (config.customHostsSourceUrl) — ниже задано только значение по умолчанию.
 const CUSTOM_HOSTS_MARK_START = '# === Zapret GUI: дополнение hosts (WhatsApp/Facebook/Instagram/Roblox) — начало ===';
 const CUSTOM_HOSTS_MARK_END = '# === Zapret GUI: дополнение hosts — конец ===';
-const CUSTOM_HOSTS_LINES = [
+const DEFAULT_CUSTOM_HOSTS_URL =
+  'https://raw.githubusercontent.com/Dimasach2023/hosts-custom/main/custom-hosts.txt';
+// Список на случай, если ни разу не удавалось скачать файл из репозитория
+// (самый первый запуск без интернета) — как только скачивание пройдёт
+// успешно, используется уже скачанный (закэшированный) список.
+const FALLBACK_CUSTOM_HOSTS_LINES = [
   '57.144.245.32 whatsapp.com',
   '57.144.245.32 www.whatsapp.com',
   '57.144.245.32 web.whatsapp.com',
@@ -80,6 +91,153 @@ const CUSTOM_HOSTS_LINES = [
   '57.144.244.34 www.instagram.com',
   '96.16.53.163 tr.rbxcdn.com',
 ];
+function customHostsSourceUrl() {
+  return (config.customHostsSourceUrl || DEFAULT_CUSTOM_HOSTS_URL).trim();
+}
+function parseHostsLines(text) {
+  return text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith('#'));
+}
+// Список, который реально используется при включении дополнения: сначала
+// пробуем то, что закэшировано из репозитория, и только если кэша ещё нет
+// (первый запуск, ни разу не было интернета) — встроенный fallback-список.
+function getCustomHostsLines() {
+  if (config.customHostsCachedText) {
+    const lines = parseHostsLines(config.customHostsCachedText);
+    if (lines.length > 0) return lines;
+  }
+  return FALLBACK_CUSTOM_HOSTS_LINES;
+}
+function hashLines(lines) {
+  return crypto.createHash('sha256').update(lines.join('\n'), 'utf-8').digest('hex');
+}
+// Скачивает актуальный список из репозитория и кладёт его в кэш
+// (config.json). Сам системный hosts-файл не трогает — этим занимаются
+// toggleCustomHosts() и updateCustomHostsFile() ниже.
+async function fetchCustomHostsFromRepo() {
+  const url = customHostsSourceUrl();
+  const sep = url.includes('?') ? '&' : '?';
+  const text = await httpsGetText(url + sep + 't=' + Date.now(), 15000);
+  const lines = parseHostsLines(text);
+  if (lines.length === 0) throw new Error('пустой или некорректный файл в репозитории');
+  config.customHostsCachedText = text;
+  config.customHostsCachedHash = hashLines(lines);
+  config.customHostsCachedAt = Date.now();
+  saveConfig();
+  return lines;
+}
+// Только проверяет, есть ли в репозитории более новая версия списка —
+// сам hosts-файл и кэш не трогает (аналог "Проверить обновления" для
+// основного zapret).
+async function checkCustomHostsUpdate() {
+  sendLog('> Проверка обновлений дополнения hosts (из вашего репозитория)...');
+  try {
+    const url = customHostsSourceUrl();
+    const sep = url.includes('?') ? '&' : '?';
+    const text = await httpsGetText(url + sep + 't=' + Date.now(), 15000);
+    const lines = parseHostsLines(text);
+    if (lines.length === 0) throw new Error('пустой или некорректный файл в репозитории');
+    const remoteHash = hashLines(lines);
+    const hasUpdate = remoteHash !== config.customHostsCachedHash;
+    if (hasUpdate) {
+      sendLog(`> Доступно обновление дополнения hosts (${lines.length} строк). Нажмите «Обновить список сейчас», чтобы применить.`);
+      notify('info', 'Доступно обновление дополнения hosts.');
+    } else {
+      sendLog(`> Дополнение hosts уже в актуальном состоянии (${lines.length} строк).`);
+      notify('info', 'Дополнение hosts уже актуально.');
+    }
+    return { hasUpdate, lines: lines.length };
+  } catch (e) {
+    sendLog('[WARN] Не удалось проверить обновления дополнения hosts: ' + e.message);
+    notify('error', 'Не удалось проверить обновления дополнения hosts: ' + e.message);
+    return null;
+  }
+}
+// Выносим запись/удаление блока из hosts-файла в отдельную функцию, чтобы
+// переиспользовать её и в toggleCustomHosts(true), и при обновлении уже
+// применённого списка свежими данными из репозитория.
+function applyCustomHostsBlock(lines) {
+  const hostsPath = getHostsPath();
+  let content = readHostsFile();
+  const blockRe = new RegExp(
+    `\\r?\\n?${escapeRegExp(CUSTOM_HOSTS_MARK_START)}[\\s\\S]*?${escapeRegExp(CUSTOM_HOSTS_MARK_END)}\\r?\\n?`,
+    'g'
+  );
+  content = content.replace(blockRe, '\n');
+  const block = [CUSTOM_HOSTS_MARK_START, ...lines, CUSTOM_HOSTS_MARK_END].join('\r\n');
+  content = content.replace(/[\s\r\n]+$/, '');
+  content = content + '\r\n\r\n' + block + '\r\n';
+  fs.writeFileSync(hostsPath, content, 'utf-8');
+}
+// Скачивает свежий список из репозитория и, если блок сейчас применён в
+// hosts-файле, сразу обновляет его на месте. Если блок ещё не применён —
+// просто обновляет кэш, свежие данные подставятся при следующем включении.
+async function updateCustomHostsFile() {
+  sendLog('> Обновление дополнения hosts из репозитория...');
+  try {
+    const lines = await fetchCustomHostsFromRepo();
+    if (customHostsApplied()) {
+      applyCustomHostsBlock(lines);
+      sendLog(`> Дополнение hosts обновлено в hosts-файле (${lines.length} строк).`);
+      notify('success', 'Дополнение hosts обновлено.');
+    } else {
+      sendLog(`> Список получен из репозитория и сохранён (${lines.length} строк) — применится при включении дополнения hosts.`);
+      notify('success', 'Список получен из репозитория и сохранён.');
+    }
+  } catch (e) {
+    sendLog('[ERROR] Не удалось обновить дополнение hosts: ' + e.message + ' (запустите GUI от имени администратора).');
+    notify('error', 'Не удалось обновить дополнение hosts: ' + e.message);
+  }
+  pushState();
+}
+function setCustomHostsSourceUrl(url) {
+  const trimmed = (url || '').trim();
+  // httpsGetText() всегда использует модуль https — если пользователь
+  // случайно вставит http:// или ссылку вообще без схемы, запрос упадёт
+  // с малопонятной ошибкой уровня протокола ("Protocol not supported").
+  // Проверяем схему сразу при сохранении и явно объясняем требование,
+  // вместо того чтобы дать этой ошибке всплыть при следующей загрузке.
+  if (trimmed && !/^https:\/\//i.test(trimmed)) {
+    sendLog(`[ERROR] Ссылка на дополнение hosts должна начинаться с https:// (получено: «${trimmed}»).`);
+    notify('error', 'Ссылка должна начинаться с https:// — настройка не сохранена.');
+    return { ok: false, error: 'URL должен начинаться с https://' };
+  }
+  config.customHostsSourceUrl = trimmed;
+  saveConfig();
+  pushState();
+  return { ok: true };
+}
+// Тихая автопроверка при запуске GUI (если включена галочка "Проверять
+// обновления при запуске"). В отличие от checkCustomHostsUpdate()/
+// updateCustomHostsFile() ничего не логирует и не уведомляет, если список
+// не изменился, — только когда реально появилась новая версия.
+async function autoCheckCustomHostsUpdate() {
+  try {
+    const url = customHostsSourceUrl();
+    const sep = url.includes('?') ? '&' : '?';
+    const text = await httpsGetText(url + sep + 't=' + Date.now(), 15000);
+    const lines = parseHostsLines(text);
+    if (lines.length === 0) throw new Error('пустой или некорректный файл в репозитории');
+    const remoteHash = hashLines(lines);
+    if (remoteHash === config.customHostsCachedHash) return; // уже актуально
+    config.customHostsCachedText = text;
+    config.customHostsCachedHash = remoteHash;
+    config.customHostsCachedAt = Date.now();
+    saveConfig();
+    if (customHostsApplied()) {
+      applyCustomHostsBlock(lines);
+      sendLog(`> Дополнение hosts автоматически обновлено при запуске (${lines.length} строк).`);
+      notify('info', 'Дополнение hosts обновлено автоматически.');
+    } else {
+      sendLog(`> Список дополнения hosts обновлён в фоне (${lines.length} строк), применится при включении.`);
+    }
+    pushState();
+  } catch (e) {
+    sendLog('[WARN] Автопроверка обновлений дополнения hosts не удалась: ' + e.message);
+  }
+}
 
 let mainWindow = null;
 let tray = null;
@@ -155,6 +313,11 @@ let config = Object.assign(
     tgwsSecret: '', // 32 hex-символа; если пусто — сгенерируется автоматически при первом запуске
     tgwsFakeTlsDomain: '',
     tgwsNoCfproxy: false,
+    // ---- дополнение hosts от разработчика GUI ----
+    customHostsSourceUrl: '', // пусто = использовать DEFAULT_CUSTOM_HOSTS_URL
+    customHostsCachedText: '',
+    customHostsCachedHash: '',
+    customHostsCachedAt: null,
   },
   loadConfigFile()
 );
@@ -163,6 +326,15 @@ let config = Object.assign(
 // антивируса), подхватим её значение один раз при первом запуске новой версии.
 if (loadConfigFile().autoUpdateCheck === undefined && fs.existsSync(CHECK_UPDATES_FLAG)) {
   config.autoUpdateCheck = true;
+}
+// Фиксируем версию zapret в конфиге при первом запуске новой версии GUI,
+// а не полагаемся каждый раз на LOCAL_VERSION как запасной вариант —
+// иначе после нескольких обновлений GUI без явного обновления zapret
+// сравнение версий в checkForUpdates()/updateZapretFiles() было бы
+// неточным, если LOCAL_VERSION когда-нибудь разойдётся с реальной сборкой.
+if (!config.zapretVersion) {
+  config.zapretVersion = LOCAL_VERSION;
+  saveConfig();
 }
 
 // ---------- utils ----------
@@ -275,64 +447,93 @@ function syncGameFilterFile() {
 }
 
 // ---------- winws process control ----------
+// startWinws()/stopWinws() возвращают Promise, который резолвится только
+// когда процесс реально запущен/убит — раньше вызовы были "выстрелил и забыл",
+// из-за чего код, идущий следом (например, завершение теста стратегий),
+// мог считать winws.exe остановленным ещё до того, как taskkill в реальности
+// отработал.
 function startWinws() {
-  if (!isWin) {
-    sendLog('[ERROR] winws.exe запускается только на Windows.');
-    notify('error', 'winws.exe запускается только на Windows.');
-    return;
-  }
-  if (!fs.existsSync(WINWS_EXE)) {
-    sendLog('[ERROR] Не найден bin\\winws.exe внутри приложения.');
-    notify('error', 'Не найден bin\\winws.exe внутри приложения.');
-    return;
-  }
-  stopWinws(() => {
-    const strategy = currentStrategy();
-    syncGameFilterFile();
-    const args = buildArgs(strategy);
-    sendLog(`> Запуск стратегии: ${strategy.name}`);
-    try {
-      winwsProcess = spawn(WINWS_EXE, args, { cwd: BIN_DIR, windowsHide: true });
-    } catch (e) {
-      sendLog('[ERROR] Не удалось запустить winws.exe: ' + e.message);
-      notify('error', 'Не удалось запустить winws.exe: ' + e.message);
-      winwsProcess = null;
-      pushState();
-      return;
+  return new Promise((resolve) => {
+    if (!isWin) {
+      sendLog('[ERROR] winws.exe запускается только на Windows.');
+      notify('error', 'winws.exe запускается только на Windows.');
+      return resolve();
     }
-    notify('success', `Стратегия «${strategy.name}» запущена.`);
-    winwsProcess.stdout.on('data', (d) => sendLog(d.toString('utf8')));
-    winwsProcess.stderr.on('data', (d) => sendLog(d.toString('utf8')));
-    winwsProcess.on('error', (e) => {
-      sendLog('[ERROR] ' + e.message);
-      notify('error', e.message);
-      winwsProcess = null;
+    if (!fs.existsSync(WINWS_EXE)) {
+      sendLog('[ERROR] Не найден bin\\winws.exe внутри приложения.');
+      notify('error', 'Не найден bin\\winws.exe внутри приложения.');
+      return resolve();
+    }
+    stopWinws(() => {
+      const strategy = currentStrategy();
+      syncGameFilterFile();
+      const args = buildArgs(strategy);
+      sendLog(`> Запуск стратегии: ${strategy.name}`);
+      try {
+        winwsProcess = spawn(WINWS_EXE, args, { cwd: BIN_DIR, windowsHide: true });
+      } catch (e) {
+        sendLog('[ERROR] Не удалось запустить winws.exe: ' + e.message);
+        notify('error', 'Не удалось запустить winws.exe: ' + e.message);
+        winwsProcess = null;
+        pushState();
+        return resolve();
+      }
+      notify('success', `Стратегия «${strategy.name}» запущена.`);
+      winwsProcess.stdout.on('data', (d) => sendLog(d.toString('utf8')));
+      winwsProcess.stderr.on('data', (d) => sendLog(d.toString('utf8')));
+      winwsProcess.on('error', (e) => {
+        sendLog('[ERROR] ' + e.message);
+        notify('error', e.message);
+        winwsProcess = null;
+        pushState();
+      });
+      winwsProcess.on('exit', (code) => {
+        sendLog(`> winws.exe завершился (код ${code})`);
+        if (code !== 0 && code !== null && !stoppingIntentionally) notify('error', `winws.exe неожиданно завершился (код ${code}).`);
+        winwsProcess = null;
+        pushState();
+      });
       pushState();
+      resolve();
     });
-    winwsProcess.on('exit', (code) => {
-      sendLog(`> winws.exe завершился (код ${code})`);
-      if (code !== 0 && code !== null && !stoppingIntentionally) notify('error', `winws.exe неожиданно завершился (код ${code}).`);
-      winwsProcess = null;
-      pushState();
-    });
-    pushState();
   });
 }
 function stopWinws(cb) {
-  stoppingIntentionally = true;
-  const finish = () => {
-    winwsProcess = null;
-    if (cb) cb();
-    pushState();
-    stoppingIntentionally = false;
-  };
-  if (winwsProcess && winwsProcess.pid) {
-    exec(`taskkill /PID ${winwsProcess.pid} /T /F`, () => finish());
-  } else if (isWin) {
-    exec('taskkill /IM winws.exe /F', () => finish());
-  } else {
-    finish();
-  }
+  return new Promise((resolveOuter) => {
+    stoppingIntentionally = true;
+    const finish = () => {
+      winwsProcess = null;
+      stoppingIntentionally = false;
+      pushState();
+      if (cb) cb();
+      resolveOuter();
+    };
+    // Страховка: после taskkill по PID дополнительно добиваем все winws.exe
+    // по имени процесса. Раньше ошибка taskkill'а по PID (например, "Отказано
+    // в доступе" или процесс уже сменил PID) молча проглатывалась, и finish()
+    // всё равно вызывался — GUI считал winws.exe остановленным, хотя реальный
+    // процесс мог продолжать работать в фоне (именно это и давало эффект
+    // "не останавливается" после теста стратегий/active fake).
+    const killByImageName = () => {
+      if (!isWin) return finish();
+      exec('taskkill /IM winws.exe /F', () => finish());
+    };
+    // Если процесс уже сам завершился (exitCode !== null), его PID мог быть
+    // к этому моменту переиспользован Windows для другого процесса — в этом
+    // случае taskkill по PID убивать не нужно вовсе, сразу добиваем по имени
+    // (что и так безопасно: убьёт только реальные winws.exe).
+    const pidStillOurs = winwsProcess && winwsProcess.pid && winwsProcess.exitCode === null;
+    if (pidStillOurs) {
+      exec(`taskkill /PID ${winwsProcess.pid} /T /F`, (err) => {
+        if (err) sendLog('[WARN] taskkill по PID не сработал, добиваю winws.exe по имени процесса.');
+        killByImageName();
+      });
+    } else if (isWin) {
+      killByImageName();
+    } else {
+      finish();
+    }
+  });
 }
 function checkWinwsRunning() {
   return new Promise((resolve) => {
@@ -425,7 +626,11 @@ function stopTgws(cb) {
     pushState();
     stoppingTgwsIntentionally = false;
   };
-  if (tgwsProcess && tgwsProcess.pid) {
+  // Та же страховка от переиспользованного PID, что и в stopWinws(): если
+  // процесс уже сам завершился, его PID мог достаться другому процессу —
+  // в этом случае убиваем сразу по имени, а не по (уже чужому) PID.
+  const tgwsPidStillOurs = tgwsProcess && tgwsProcess.pid && tgwsProcess.exitCode === null;
+  if (tgwsPidStillOurs) {
     exec(`taskkill /PID ${tgwsProcess.pid} /T /F`, () => finish());
   } else if (isWin) {
     exec('taskkill /IM tg-ws-proxy.exe /F', () => finish());
@@ -639,6 +844,14 @@ async function updateZapretFiles() {
       if (!inTarget) continue;
 
       const destPath = path.join(ZAPRET_ROOT, ...relative.split('/'));
+      // Защита от zip-slip: имя записи в архиве может содержать "../" и
+      // вести за пределы ZAPRET_ROOT — на этот случай запись пропускаем,
+      // а не доверяем пути из архива вслепую.
+      const normalizedRoot = ZAPRET_ROOT + path.sep;
+      if (!destPath.startsWith(normalizedRoot)) {
+        sendLog(`[WARN] Пропущена запись с подозрительным путём в архиве: ${entry.entryName}`);
+        continue;
+      }
       fs.mkdirSync(path.dirname(destPath), { recursive: true });
       fs.writeFileSync(destPath, entry.getData());
       extractedCount++;
@@ -749,7 +962,7 @@ function customHostsApplied() {
     return false;
   }
 }
-function toggleCustomHosts(enable) {
+async function toggleCustomHosts(enable) {
   const alreadyApplied = customHostsApplied();
   if (enable && alreadyApplied) {
     sendLog('> Дополнение hosts от разработчика GUI уже активно.');
@@ -764,26 +977,32 @@ function toggleCustomHosts(enable) {
     return;
   }
   try {
-    const hostsPath = getHostsPath();
-    let content = readHostsFile();
-    // на всякий случай убираем старый блок (если уже был добавлен ранее), чтобы не дублировать
-    const blockRe = new RegExp(
-      `\\r?\\n?${escapeRegExp(CUSTOM_HOSTS_MARK_START)}[\\s\\S]*?${escapeRegExp(CUSTOM_HOSTS_MARK_END)}\\r?\\n?`,
-      'g'
-    );
-    content = content.replace(blockRe, '\n');
     if (enable) {
-      const block = [CUSTOM_HOSTS_MARK_START, ...CUSTOM_HOSTS_LINES, CUSTOM_HOSTS_MARK_END].join('\r\n');
-      content = content.replace(/[\s\r\n]+$/, '');
-      content = content + '\r\n\r\n' + block + '\r\n';
-      sendLog('> Дополнение hosts от разработчика GUI добавлено.');
+      // При включении пробуем сначала подтянуть свежий список из
+      // репозитория; если сети нет или репозиторий недоступен — используем
+      // то, что уже закэшировано (или встроенный fallback на первый запуск).
+      try {
+        await fetchCustomHostsFromRepo();
+      } catch (e) {
+        sendLog('[WARN] Не удалось получить список из репозитория, использую закэшированный/встроенный: ' + e.message);
+      }
+      const lines = getCustomHostsLines();
+      applyCustomHostsBlock(lines);
+      sendLog(`> Дополнение hosts от разработчика GUI добавлено (${lines.length} строк).`);
       notify('success', 'Дополнение hosts добавлено (WhatsApp/Facebook/Instagram/Roblox).');
     } else {
+      const hostsPath = getHostsPath();
+      let content = readHostsFile();
+      const blockRe = new RegExp(
+        `\\r?\\n?${escapeRegExp(CUSTOM_HOSTS_MARK_START)}[\\s\\S]*?${escapeRegExp(CUSTOM_HOSTS_MARK_END)}\\r?\\n?`,
+        'g'
+      );
+      content = content.replace(blockRe, '\n');
       content = content.replace(/\n{3,}/g, '\n\n');
+      fs.writeFileSync(hostsPath, content, 'utf-8');
       sendLog('> Дополнение hosts от разработчика GUI убрано.');
       notify('success', 'Дополнение hosts убрано.');
     }
-    fs.writeFileSync(hostsPath, content, 'utf-8');
   } catch (e) {
     sendLog('[ERROR] Не удалось изменить hosts-файл: ' + e.message + ' (запустите GUI от имени администратора).');
     notify('error', 'Не удалось изменить hosts-файл — нужны права администратора.');
@@ -868,6 +1087,14 @@ function listBinFiles() {
 function replaceActiveFake(slot, sourceFile) {
   const targetName = slot === 'discord' ? 'ACTIVE_DISCORD_UDP.bin' : 'ACTIVE_GAME_UDP.bin';
   const target = bin(targetName);
+  // Источником не может быть сам ACTIVE_*.bin (ни для своего слота, ни для
+  // чужого) — это файл-назначение, а не кандидат; копирование "самого в
+  // себя" в лучшем случае бесполезно, в худшем — риск повредить файл.
+  if (sourceFile === 'ACTIVE_DISCORD_UDP.bin' || sourceFile === 'ACTIVE_GAME_UDP.bin') {
+    sendLog(`[ERROR] «${sourceFile}» нельзя использовать как источник — это файл-назначение, выберите другой .bin.`);
+    notify('error', `«${sourceFile}» нельзя использовать как источник — выберите другой .bin-файл.`);
+    return;
+  }
   const source = bin(sourceFile);
   try {
     if (!fs.existsSync(source)) throw new Error('файл не найден: ' + sourceFile);
@@ -919,13 +1146,49 @@ function probeHost(host, port, timeoutMs) {
   });
 }
 let autoPickRunning = { discord: false, game: false };
+// Общий "замок" на всё, что по очереди перезапускает общий winwsProcess в
+// цикле (автоподбор fake-файла и тест стратегий): раньше автоподбор для
+// Discord/Game и тест стратегий не знали друг о друге и могли быть запущены
+// пользователем одновременно — все они дёргают один и тот же winwsProcess,
+// что приводило бы к перепутанным логам, гонкам за startWinws()/stopWinws()
+// и подмене bin-файлов посреди чужого теста.
+function winwsBusyReason() {
+  if (autoPickRunning.discord) return 'автоподбор fake-файла для Discord';
+  if (autoPickRunning.game) return 'автоподбор fake-файла для игр';
+  if (strategyTestRunning) return 'тест стратегий';
+  return null;
+}
+// Общий guard для IPC-хендлеров, которые тоже трогают winwsProcess/bin-файлы
+// (старт/стоп, смена стратегии, game filter, служба, ipset, замена fake) —
+// раньше блокировка действовала только между автоподбором и тестом стратегий
+// друг относительно друга, но не мешала пользователю параллельно нажать,
+// например, «Старт»/«Стоп» или сменить стратегию посреди автоматического
+// теста, ломая ему результаты. Возвращает true, если действие нужно
+// отменить (сам guard уже отправил лог/тост с объяснением).
+function blockIfWinwsBusy(actionLabel) {
+  const busyWith = winwsBusyReason();
+  if (!busyWith) return false;
+  sendLog(`[WARN] «${actionLabel}» отменено: сейчас выполняется «${busyWith}». Дождитесь завершения.`);
+  notify('error', `Сейчас выполняется «${busyWith}» — дождитесь завершения перед этим действием.`);
+  return true;
+}
 function sendAutoPickProgress(slot, payload) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send('auto-pick-progress', { slot, ...payload });
 }
 async function autoPickFake(slot, testHost, testPort) {
   if (autoPickRunning[slot]) return;
+  const busyWith = winwsBusyReason();
+  if (busyWith) {
+    sendLog(`[WARN] Автоподбор не запущен: сейчас уже выполняется «${busyWith}». Дождитесь завершения.`);
+    notify('error', `Сейчас уже выполняется «${busyWith}» — дождитесь завершения.`);
+    return;
+  }
   autoPickRunning[slot] = true;
+  // Запоминаем, был ли winws.exe запущен до начала автоподбора — чтобы по
+  // окончании корректно вернуться в исходное состояние, а не всегда
+  // оставлять процесс висеть запущенным.
+  const wasManagedByUs = !!winwsProcess;
   const port = parseInt(testPort, 10) || 443;
   const host = (testHost || '').trim() || 'discord.com';
   const targetName = slot === 'discord' ? 'ACTIVE_DISCORD_UDP.bin' : 'ACTIVE_GAME_UDP.bin';
@@ -965,7 +1228,7 @@ async function autoPickFake(slot, testHost, testPort) {
         results.push({ file, ok: false });
         continue;
       }
-      startWinws();
+      await startWinws();
       await delay(1600); // дать winws/драйверу подняться
       const res = await probeHost(host, port, 4000);
       results.push({ file, ok: res.ok, ms: res.ms });
@@ -974,29 +1237,38 @@ async function autoPickFake(slot, testHost, testPort) {
     }
 
     const successful = results.filter((r) => r.ok).sort((a, b) => a.ms - b.ms);
-    if (successful.length > 0) {
-      const best = successful[0];
-      fs.copyFileSync(bin(best.file), target);
-      // как и при ручной замене — фиксируем выбор, чтобы он не слетал после перезапуска GUI
-      if (slot === 'discord') config.activeFakeDiscord = best.file;
-      else config.activeFakeGame = best.file;
-      saveConfig();
-      startWinws();
-      sendLog(`> Лучший результат: ${best.file} (${best.ms} мс). Применён и запущен.`);
-      notify('success', `Автоподбор завершён: лучший файл — ${best.file} (${best.ms} мс).`);
-      return { file: best.file };
-    } else if (original) {
+    const best = successful[0] || null;
+
+    // Раньше автоподбор сам, без единого явного действия пользователя,
+    // копировал "лучший" файл в ACTIVE_*.bin и перезапускал winws — заметить
+    // это можно было только по мелькнувшему тосту (5 сек) или по журналу,
+    // никакой постоянной пометки "вот что выбрано и почему" не было, а
+    // применялось всё автоматически, без кнопки "Применить".
+    // Теперь автоподбор ничего не применяет сам: он всегда возвращает
+    // тестируемый .bin-файл в то состояние, что было до теста, и отдаёт
+    // в интерфейс полный ранжированный список результатов (панель ниже,
+    // как у теста стратегий) — лучший вариант там явно подсвечен и
+    // предлагается кнопкой «Применить», как при ручном выборе.
+    if (original) {
       fs.writeFileSync(target, original);
-      startWinws();
-      sendLog('> Ни один файл не прошёл проверку. Восстановлен исходный fake-файл.');
-      notify('error', 'Ни один файл не прошёл проверку — восстановлен исходный.');
     } else {
-      sendLog('> Ни один файл не прошёл проверку.');
-      notify('error', 'Ни один файл не прошёл проверку.');
+      sendLog('[WARN] Исходного active fake-файла не было — оставляю последний протестированный до явного выбора через «Применить».');
+    }
+    if (wasManagedByUs) await startWinws();
+    else await stopWinws();
+
+    if (best) {
+      sendLog(`> Лучший результат: ${best.file} (${best.ms} мс из ${successful.length} успешных). Выберите его в списке и нажмите «Применить», чтобы использовать.`);
+      notify('success', `Автоподбор завершён. Лучший файл — ${best.file} (${best.ms} мс) — выберите и нажмите «Применить».`);
+    } else {
+      sendLog('> Ни один файл не прошёл проверку. Ничего не изменено.');
+      notify('error', 'Ни один файл не прошёл проверку — ничего не применено.');
     }
     sendLog('> === Автоподбор завершён ===');
     sendLog('  Учтите: это эвристическая проверка доступности хоста, а не гарантия обхода блокировки — итоговый выбор стоит перепроверить в самом приложении (Discord/игра).');
-    return null;
+    const sorted = [...results].sort((a, b) => (b.ok - a.ok) || ((a.ms ?? Infinity) - (b.ms ?? Infinity)));
+    sendAutoPickProgress(slot, { status: 'finished', results: sorted, best: best ? best.file : null });
+    return { best: best ? best.file : null, results: sorted };
   } finally {
     autoPickRunning[slot] = false;
     pushState();
@@ -1086,6 +1358,12 @@ async function runStrategyTestsInline() {
     sendLog('[WARN] Тест стратегий уже выполняется.');
     return null;
   }
+  const busyWith = winwsBusyReason();
+  if (busyWith) {
+    sendLog(`[WARN] Тест стратегий не запущен: сейчас уже выполняется «${busyWith}». Дождитесь завершения.`);
+    notify('error', `Сейчас уже выполняется «${busyWith}» — дождитесь завершения.`);
+    return null;
+  }
   if (!isWin) {
     sendLog('[ERROR] Тест стратегий доступен только на Windows.');
     notify('error', 'Тест стратегий доступен только на Windows.');
@@ -1115,7 +1393,7 @@ async function runStrategyTestsInline() {
       const s = strategies[i];
       sendStrategyTestProgress({ index: i + 1, total, name: s.name, status: 'testing' });
       config.strategyId = s.id; // не сохраняем в config.json — это только для теста
-      startWinws();
+      await startWinws();
       await delay(1800); // дать winws/драйверу подняться
       const perTarget = await Promise.all(
         STRATEGY_TEST_TARGETS.map(async (t) => {
@@ -1132,10 +1410,14 @@ async function runStrategyTestsInline() {
     sendLog('[ERROR] Тест стратегий прерван: ' + e.message);
   } finally {
     config.strategyId = originalStrategyId;
+    // Раньше startWinws()/stopWinws() здесь не дожидались (не было await),
+    // из-за чего pushState() ниже мог отправить в интерфейс состояние ДО
+    // того, как процесс реально остановился/перезапустился — winws.exe
+    // выглядел как "не останавливающийся" после завершения теста.
     if (wasManagedByUs) {
-      startWinws();
+      await startWinws();
     } else {
-      stopWinws();
+      await stopWinws();
     }
     strategyTestRunning = false;
     pushState();
@@ -1233,9 +1515,17 @@ async function getStateObject() {
     autostartWinws: config.autostartWinws,
     running: !!winwsProcess || runningNow,
     managedByUs: !!winwsProcess,
+    // Отражаем состояние "занято автоподбором/тестом" и в push-состоянии,
+    // чтобы интерфейс мог визуально заблокировать Старт/Стоп, выбор
+    // стратегии, кнопки службы и "Применить" fake — а не полагаться только
+    // на тост-отказ от blockIfWinwsBusy() постфактум.
+    winwsBusy: winwsBusyReason(),
     platform: process.platform,
     ipsetStatus: ipsetStatus(),
     customHostsApplied: customHostsApplied(),
+    customHostsSourceUrl: customHostsSourceUrl(),
+    customHostsLinesCount: getCustomHostsLines().length,
+    customHostsCachedAt: config.customHostsCachedAt || null,
     autoUpdateCheck: config.autoUpdateCheck,
     binFiles: listBinFiles(),
     activeFakeDiscord: config.activeFakeDiscord,
@@ -1296,7 +1586,14 @@ function updateTrayMenu(running) {
   const menu = Menu.buildFromTemplate([
     { label: 'Открыть Zapret GUI', click: () => mainWindow.show() },
     { type: 'separator' },
-    { label: running ? '■ Остановить' : '▶ Запустить', click: () => (running ? stopWinws() : startWinws()) },
+    { label: running ? '■ Остановить' : '▶ Запустить', click: () => {
+      // Тот же guard, что и у кнопок/IPC — раньше пункт трея дёргал
+      // startWinws()/stopWinws() напрямую в обход blockIfWinwsBusy(), так что
+      // через трей можно было вмешаться в идущий автоподбор/тест стратегий
+      // так же, как раньше это позволяли кнопки в окне.
+      if (blockIfWinwsBusy(running ? 'Остановка' : 'Запуск')) return;
+      running ? stopWinws() : startWinws();
+    } },
     {
       label: tgwsRunning ? '■ Остановить Telegram-прокси' : '▶ Запустить Telegram-прокси',
       click: () => (tgwsRunning ? stopTgws() : startTgws()),
@@ -1343,6 +1640,9 @@ if (!gotLock) {
     createTray();
     if (config.autostartWinws) setTimeout(() => startWinws(), 800);
     if (config.tgwsAutostart) setTimeout(() => startTgws(), 1000);
+    // Автопроверка обновлений дополнения hosts из репозитория — только если
+    // включена галочка "Проверять обновления при запуске" в настройках.
+    if (config.autoUpdateCheck) setTimeout(() => autoCheckCustomHostsUpdate(), 3000);
   });
   app.on('window-all-closed', () => {});
   app.on('before-quit', () => {
@@ -1353,6 +1653,7 @@ if (!gotLock) {
 // ---------- IPC ----------
 ipcMain.handle('request-state', () => getStateObject());
 ipcMain.handle('select-strategy', (e, id) => {
+  if (blockIfWinwsBusy('Смена стратегии')) return;
   config.strategyId = id;
   saveConfig();
   const wasRunning = !!winwsProcess;
@@ -1360,14 +1661,21 @@ ipcMain.handle('select-strategy', (e, id) => {
   if (wasRunning) startWinws();
 });
 ipcMain.handle('set-game-filter', (e, mode) => {
+  if (blockIfWinwsBusy('Смена Game Filter')) return;
   config.gameFilterMode = mode;
   saveConfig();
   const wasRunning = !!winwsProcess;
   pushState();
   if (wasRunning) startWinws();
 });
-ipcMain.handle('start', () => startWinws());
-ipcMain.handle('stop', () => stopWinws(() => notify('info', 'Остановлено.')));
+ipcMain.handle('start', () => {
+  if (blockIfWinwsBusy('Запуск')) return;
+  return startWinws();
+});
+ipcMain.handle('stop', () => {
+  if (blockIfWinwsBusy('Остановка')) return;
+  return stopWinws(() => notify('info', 'Остановлено.'));
+});
 ipcMain.handle('toggle-autostart-app', (e, enable) => {
   config.autostartApp = enable;
   saveConfig();
@@ -1379,20 +1687,35 @@ ipcMain.handle('toggle-autostart-winws', (e, enable) => {
   saveConfig();
   pushState();
 });
-ipcMain.handle('service-install', () => serviceInstall());
-ipcMain.handle('service-remove', () => serviceRemove());
+ipcMain.handle('service-install', () => {
+  if (blockIfWinwsBusy('Установка службы')) return;
+  return serviceInstall();
+});
+ipcMain.handle('service-remove', () => {
+  if (blockIfWinwsBusy('Удаление службы')) return;
+  return serviceRemove();
+});
 ipcMain.handle('ipset-cycle', () => ipsetCycle());
 ipcMain.handle('check-updates', () => checkForUpdates());
-ipcMain.handle('update-zapret-files', () => updateZapretFiles());
+ipcMain.handle('update-zapret-files', () => {
+  if (blockIfWinwsBusy('Обновление zapret')) return;
+  return updateZapretFiles();
+});
 ipcMain.handle('update-ipset', () => updateIpsetList());
 ipcMain.handle('update-hosts', () => updateHostsFile());
 ipcMain.handle('toggle-auto-update-check', (e, enable) => toggleAutoUpdateCheck(enable));
-ipcMain.handle('replace-fake', (e, { slot, sourceFile }) => replaceActiveFake(slot, sourceFile));
+ipcMain.handle('replace-fake', (e, { slot, sourceFile }) => {
+  if (blockIfWinwsBusy('Замена активного fake-файла')) return;
+  return replaceActiveFake(slot, sourceFile);
+});
 ipcMain.handle('auto-pick-fake', (e, { slot, host, port }) => autoPickFake(slot, host, port));
 ipcMain.handle('run-diagnostics', () => runDiagnostics());
 ipcMain.handle('run-tests', () => runStrategyTestsInline());
 ipcMain.handle('run-tests-external', () => runTests());
 ipcMain.handle('toggle-custom-hosts', (e, enable) => toggleCustomHosts(enable));
+ipcMain.handle('check-custom-hosts-update', () => checkCustomHostsUpdate());
+ipcMain.handle('update-custom-hosts', () => updateCustomHostsFile());
+ipcMain.handle('set-custom-hosts-url', (e, url) => setCustomHostsSourceUrl(url));
 ipcMain.handle('list-lists', () => listEditableFiles());
 ipcMain.handle('read-list', (e, name) => {
   try {

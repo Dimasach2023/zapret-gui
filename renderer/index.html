@@ -121,10 +121,14 @@
           <div class="hint">
             Добавляет в системный hosts альтернативные IP для WhatsApp, Facebook, Instagram и Roblox (tr.rbxcdn.com) —
             может помочь, если основные адреса заблокированы у вашего провайдера. Требуются права администратора.
+            Список загружается из GitHub-репозитория (ниже) и кэшируется на случай отсутствия интернета.
           </div>
+          <div class="hint" id="customHostsInfo"></div>
           <div class="row">
             <button id="btnUseCustomHosts" class="btn secondary">Использовать дополнение hosts</button>
             <button id="btnRemoveCustomHosts" class="btn ghost">Убрать дополнение hosts</button>
+            <button id="btnCheckCustomHostsUpdate" class="btn ghost">Проверить обновления списка</button>
+            <button id="btnUpdateCustomHosts" class="btn ghost">Обновить список сейчас</button>
           </div>
         </div>
 
@@ -145,9 +149,10 @@
 
           <div class="card-title-sm">Автоподбор <span class="badge-new">нет в оригинале</span></div>
           <div class="hint">
-            По очереди применяет каждый .bin-файл, перезапускает стратегию и проверяет доступность указанного хоста —
-            в конце сама применяет лучший вариант. Это эвристическая проверка (не гарантия обхода блокировки),
-            результат стоит перепроверить в самом Discord/игре.
+            По очереди применяет каждый .bin-файл, перезапускает стратегию и проверяет доступность указанного хоста.
+            Ничего не применяет автоматически — по завершении покажет ранжированный список ниже, лучший вариант
+            подсвечен; выберите его (или другой) и нажмите «Применить» у нужной строки либо в выпадающем списке выше.
+            Это эвристическая проверка (не гарантия обхода блокировки), результат стоит перепроверить в самом Discord/игре.
           </div>
           <div class="row">
             <label class="mini-label">Хост : порт</label>
@@ -159,15 +164,20 @@
             <button id="btnAutoPickGame" class="btn secondary autopick-btn">Подобрать для Game UDP</button>
           </div>
           <div class="progress-line" id="progressDiscord"></div>
+          <div id="autoPickResultsDiscord" class="strategy-test-results"></div>
           <div class="progress-line" id="progressGame"></div>
+          <div id="autoPickResultsGame" class="strategy-test-results"></div>
         </div>
 
         <div class="card controls">
           <button id="btnDiagnostics" class="btn secondary">Запустить диагностику</button>
           <button id="btnRunTests" class="btn ghost">Запустить тесты стратегий</button>
+          <button id="btnRunTestsExternal" class="btn ghost">Тесты во внешнем PowerShell</button>
           <div class="hint">
             Перебирает все стратегии из strategies.json прямо в приложении (без внешнего окна PowerShell)
             и проверяет доступность Discord/YouTube/Google по каждой из них.
+            «Тесты во внешнем PowerShell» запускают оригинальный utils\test zapret.ps1 отдельным
+            окном — используйте, если нужен вывод именно исходного скрипта тестирования zapret.
           </div>
           <div class="progress-line" id="progressStrategyTest"></div>
           <div id="strategyTestResults" class="strategy-test-results"></div>

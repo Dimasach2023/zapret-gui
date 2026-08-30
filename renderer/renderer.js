@@ -13,6 +13,7 @@ const versionHintEl = document.getElementById('versionHint');
 const fakeDiscordSelect = document.getElementById('fakeDiscordSelect');
 const fakeGameSelect = document.getElementById('fakeGameSelect');
 const customHostsPillEl = document.getElementById('customHostsPill');
+const customHostsInfoEl = document.getElementById('customHostsInfo');
 const tgwsPillEl = document.getElementById('tgwsPill');
 const chkTgwsAutostart = document.getElementById('chkTgwsAutostart');
 const chkTgwsWinStartup = document.getElementById('chkTgwsWinStartup');
@@ -26,6 +27,20 @@ let tgwsSettingsLoaded = false;
 
 let strategiesLoaded = false;
 let binFilesLoaded = false;
+
+// Небольшой helper для безопасной вставки текста внутрь innerHTML-разметки.
+// Сейчас имена стратегий/файлов приходят из локальных доверенных данных
+// (strategies.json, список .bin-файлов рядом с winws.exe), но экранирование
+// на всякий случай — на будущее и просто хорошая практика при сборке HTML
+// из шаблонных строк.
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // ---------- toast notifications ----------
 const toastsEl = document.getElementById('toasts');
@@ -53,17 +68,24 @@ function showToast({ type = 'info', text }) {
 // оборачивает клик по кнопке: блокирует её и показывает спиннер, пока идёт
 // async-действие в main-процессе — иначе непонятно, сработало ли что-то,
 // не глядя в журнал.
-function bindAsyncButton(id, handler) {
+function bindAsyncButton(id, handler, groupIds) {
   const btn = document.getElementById(id);
   if (!btn) return;
+  // groupIds — id других кнопок, которые управляют тем же общим ресурсом
+  // (winws.exe): пока одна из группы выполняется, остальные блокируются
+  // визуально, а не только на бэкенде (там уже есть свой guard, но здесь
+  // приятнее сразу показать, что кнопка недоступна, а не ждать тост-ошибку).
+  const group = (groupIds || []).map((gid) => document.getElementById(gid)).filter(Boolean);
   btn.addEventListener('click', async () => {
     btn.classList.add('loading');
     btn.disabled = true;
+    group.forEach((b) => (b.disabled = true));
     try {
       await handler();
     } finally {
       btn.classList.remove('loading');
       btn.disabled = false;
+      group.forEach((b) => (b.disabled = false));
     }
   });
 }
@@ -120,8 +142,16 @@ function renderState(state) {
     ? (state.managedByUs ? 'Работает' : 'Работает (запущено вне GUI)')
     : 'Остановлено';
 
-  document.getElementById('btnStart').disabled = state.running;
-  document.getElementById('btnStop').disabled = !state.running;
+  document.getElementById('btnStart').disabled = state.running || !!state.winwsBusy;
+  document.getElementById('btnStop').disabled = !state.running || !!state.winwsBusy;
+  strategySelect.disabled = !!state.winwsBusy;
+  document.getElementById('btnSvcInstall').disabled = !!state.winwsBusy;
+  document.getElementById('btnSvcRemove').disabled = !!state.winwsBusy;
+  document.getElementById('btnApplyDiscordFake').disabled = !!state.winwsBusy;
+  document.getElementById('btnApplyGameFake').disabled = !!state.winwsBusy;
+  gameFilterEl.querySelectorAll('.seg').forEach((btn) => {
+    btn.disabled = !!state.winwsBusy;
+  });
 
   svcStateEl.textContent = SERVICE_LABELS[state.serviceState] || state.serviceState;
   wdStateEl.textContent = SERVICE_LABELS[state.windivertState] || state.windivertState;
@@ -132,13 +162,27 @@ function renderState(state) {
   customHostsPillEl.textContent = state.customHostsApplied ? 'добавлено' : 'не добавлено';
   customHostsPillEl.className = 'pill ' + (state.customHostsApplied ? 'applied' : 'notapplied');
 
+  const cachedAt = state.customHostsCachedAt ? new Date(state.customHostsCachedAt).toLocaleString() : null;
+  customHostsInfoEl.textContent = `Строк в списке: ${state.customHostsLinesCount ?? 0}` +
+    (cachedAt ? ` · последняя загрузка из репозитория: ${cachedAt}` : ' · список ещё ни разу не загружался из репозитория');
+
   versionHintEl.textContent = `Локальная версия: ${state.localVersion}`;
   document.getElementById('footerVersion').textContent = `zapret ${state.localVersion}`;
 
   if (!binFilesLoaded && state.binFiles && state.binFiles.length) {
+    // ACTIVE_DISCORD_UDP.bin / ACTIVE_GAME_UDP.bin — это файлы-НАЗНАЧЕНИЯ, в
+    // которые копируется выбранный кандидат, а не сами кандидаты. Раньше они
+    // тоже попадали в список выбора: можно было выбрать, например,
+    // ACTIVE_DISCORD_UDP.bin как «источник» и нажать «Применить», скопировав
+    // файл сам в себя (в лучшем случае — бесполезное действие, в худшем —
+    // риск повреждения файла при копировании «на себя»). Исключаем оба
+    // ACTIVE_*.bin из списка выбора — как уже сделано для автоподбора.
+    const selectableBinFiles = state.binFiles.filter(
+      (f) => f !== 'ACTIVE_DISCORD_UDP.bin' && f !== 'ACTIVE_GAME_UDP.bin'
+    );
     for (const sel of [fakeDiscordSelect, fakeGameSelect]) {
       sel.innerHTML = '';
-      for (const f of state.binFiles) {
+      for (const f of selectableBinFiles) {
         const opt = document.createElement('option');
         opt.value = f;
         opt.textContent = f;
@@ -148,6 +192,9 @@ function renderState(state) {
     // выставляем реально применённый файл (хранится в config.json) ОДИН РАЗ, при первой
     // загрузке. Дальше это поле больше никогда не трогается автоматически (в т.ч. по
     // setInterval-опросу раз в 3 сек) — иначе несохранённый выбор пользователя затирается.
+    // Если в конфиге ещё стоит значение по умолчанию (сам ACTIVE_*.bin — то есть
+    // пользователь ещё ни разу явно не выбирал источник), оно не найдётся среди
+    // отфильтрованных опций, и просто останется первый файл списка — это ожидаемо.
     if (state.activeFakeDiscord && [...fakeDiscordSelect.options].some((o) => o.value === state.activeFakeDiscord)) {
       fakeDiscordSelect.value = state.activeFakeDiscord;
     }
@@ -213,21 +260,28 @@ chkAutoUpdateCheck.addEventListener('change', (e) => window.api.toggleAutoUpdate
 bindAsyncButton('btnApplyDiscordFake', () => window.api.replaceFake('discord', fakeDiscordSelect.value));
 bindAsyncButton('btnApplyGameFake', () => window.api.replaceFake('game', fakeGameSelect.value));
 bindAsyncButton('btnAutoPickDiscord', async () => {
+  document.getElementById('autoPickResultsDiscord').innerHTML = '';
   const res = await window.api.autoPickFake('discord', document.getElementById('probeHost').value, document.getElementById('probePort').value);
-  if (res && res.file) fakeDiscordSelect.value = res.file;
-});
+  if (res && res.best) fakeDiscordSelect.value = res.best; // только подставляем в список — не применяем
+  renderAutoPickResults('discord', res);
+}, ['btnAutoPickGame', 'btnRunTests']);
 bindAsyncButton('btnAutoPickGame', async () => {
+  document.getElementById('autoPickResultsGame').innerHTML = '';
   const res = await window.api.autoPickFake('game', document.getElementById('probeHost').value, document.getElementById('probePort').value);
-  if (res && res.file) fakeGameSelect.value = res.file;
-});
+  if (res && res.best) fakeGameSelect.value = res.best; // только подставляем в список — не применяем
+  renderAutoPickResults('game', res);
+}, ['btnAutoPickDiscord', 'btnRunTests']);
 bindAsyncButton('btnDiagnostics', () => window.api.runDiagnostics());
 bindAsyncButton('btnRunTests', async () => {
   document.getElementById('strategyTestResults').innerHTML = '';
   const results = await window.api.runTests();
   renderStrategyTestResults(results);
-});
+}, ['btnAutoPickDiscord', 'btnAutoPickGame']);
+bindAsyncButton('btnRunTestsExternal', () => window.api.runTestsExternal());
 bindAsyncButton('btnUseCustomHosts', () => window.api.toggleCustomHosts(true));
 bindAsyncButton('btnRemoveCustomHosts', () => window.api.toggleCustomHosts(false));
+bindAsyncButton('btnCheckCustomHostsUpdate', () => window.api.checkCustomHostsUpdate());
+bindAsyncButton('btnUpdateCustomHosts', () => window.api.updateCustomHosts());
 
 // ---------- Telegram (tg-ws-proxy) tab ----------
 bindAsyncButton('btnTgwsStart', () => window.api.tgwsStart());
@@ -257,14 +311,54 @@ bindAsyncButton('btnTgwsOpenLink', () => window.api.tgwsOpenLink());
 window.api.onState(renderState);
 window.api.onLog(appendLog);
 window.api.onNotify(showToast);
-window.api.onAutoPickProgress(({ slot, index, total, file, status, ms }) => {
+window.api.onAutoPickProgress(({ slot, index, total, file, status, ms, best }) => {
   const el = document.getElementById(slot === 'discord' ? 'progressDiscord' : 'progressGame');
   if (!el) return;
   el.className = 'progress-line' + (status === 'ok' ? ' ok' : status === 'fail' ? ' fail' : '');
   if (status === 'testing') el.textContent = `Тестирую ${index}/${total}: ${file}...`;
   else if (status === 'ok') el.textContent = `✓ ${index}/${total}: ${file} — ${ms} мс`;
   else if (status === 'fail') el.textContent = `✕ ${index}/${total}: ${file} — недоступно`;
+  else if (status === 'finished') el.textContent = best ? `Готово. Лучший вариант: ${best} — выберите и нажмите «Применить».` : 'Готово. Ни один файл не прошёл проверку.';
 });
+
+// Показывает ранжированный список результатов автоподбора с явной кнопкой
+// «Применить» у каждой строки — раньше лучший файл применялся автоматически
+// и незаметно (только тост на 5 секунд), теперь пользователь сам видит все
+// варианты и явно нажимает «Применить» на выбранном.
+function renderAutoPickResults(slot, res) {
+  const el = document.getElementById(slot === 'discord' ? 'autoPickResultsDiscord' : 'autoPickResultsGame');
+  const select = slot === 'discord' ? fakeDiscordSelect : fakeGameSelect;
+  if (!el) return;
+  if (!res || !res.results || res.results.length === 0) {
+    el.innerHTML = '';
+    return;
+  }
+  const rows = res.results
+    .map((r) => {
+      const isBest = res.best && r.file === res.best;
+      const scoreText = r.ok ? `${r.ms} мс` : 'недоступно';
+      return `
+      <tr class="${isBest ? 'best' : ''}" data-file="${escapeHtml(r.file)}">
+        <td>${isBest ? '★ ' : ''}${escapeHtml(r.file)}</td>
+        <td class="score">${escapeHtml(scoreText)}</td>
+        <td class="score"><button type="button" class="btn ghost small autopick-apply-btn">Применить</button></td>
+      </tr>`;
+    })
+    .join('');
+  el.innerHTML = `<table><tbody>${rows}</tbody></table>`;
+  el.querySelectorAll('tr[data-file]').forEach((row) => {
+    const file = row.dataset.file;
+    row.addEventListener('click', () => {
+      select.value = file;
+      showToast({ type: 'info', text: `Выбрано в списке: ${file}. Нажмите «Применить».` });
+    });
+    row.querySelector('.autopick-apply-btn').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      select.value = file;
+      await window.api.replaceFake(slot, file);
+    });
+  });
+}
 
 function renderStrategyTestResults(results) {
   const el = document.getElementById('strategyTestResults');
@@ -277,9 +371,9 @@ function renderStrategyTestResults(results) {
   const rows = results
     .map(
       (r) => `
-      <tr class="${r.ok === bestScore && bestScore > 0 ? 'best' : ''}" data-strategy-id="${r.id.replace(/"/g, '&quot;')}">
-        <td>${r.name}</td>
-        <td class="score">${r.ok}/${r.total}</td>
+      <tr class="${r.ok === bestScore && bestScore > 0 ? 'best' : ''}" data-strategy-id="${escapeHtml(r.id)}">
+        <td>${escapeHtml(r.name)}</td>
+        <td class="score">${escapeHtml(r.ok)}/${escapeHtml(r.total)}</td>
       </tr>`
     )
     .join('');
@@ -402,4 +496,16 @@ btnReloadList.addEventListener('click', async () => {
   if (!currentListName) return;
   if (listDirty && !window.confirm('Отменить несохранённые изменения и загрузить файл заново с диска?')) return;
   await loadListIntoEditor(currentListName);
+});
+
+// Раньше при полном выходе из приложения (пункт "Выход" в трее, закрытие
+// через диспетчер задач и т.п.) несохранённые правки в редакторе списков
+// терялись молча — окно просто скрывается при обычном закрытии (см.
+// main.js: mainWindow.on('close', ...)), но при реальном app.quit() DOM
+// всё же выгружается. Стандартный beforeunload — минимальная, но не
+// требующая доработок в main.js подстраховка от такой потери.
+window.addEventListener('beforeunload', (e) => {
+  if (!listDirty) return;
+  e.preventDefault();
+  e.returnValue = '';
 });

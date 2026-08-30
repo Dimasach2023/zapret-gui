@@ -149,7 +149,7 @@ body {
 
 .row-between { display: flex; justify-content: space-between; align-items: center; }
 
-.row { display: flex; gap: 8px; align-items: center; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
 /* stacked rows inside a card had no vertical gap, so a row of buttons
    (e.g. "Добавить в Telegram") sat flush against the input row above it
