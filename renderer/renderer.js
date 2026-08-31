@@ -280,7 +280,6 @@ bindAsyncButton('btnRunTests', async () => {
 bindAsyncButton('btnRunTestsExternal', () => window.api.runTestsExternal());
 bindAsyncButton('btnUseCustomHosts', () => window.api.toggleCustomHosts(true));
 bindAsyncButton('btnRemoveCustomHosts', () => window.api.toggleCustomHosts(false));
-bindAsyncButton('btnCheckCustomHostsUpdate', () => window.api.checkCustomHostsUpdate());
 bindAsyncButton('btnUpdateCustomHosts', () => window.api.updateCustomHosts());
 
 // ---------- Telegram (tg-ws-proxy) tab ----------

@@ -24,7 +24,6 @@ contextBridge.exposeInMainWorld('api', {
   runTestsExternal: () => ipcRenderer.invoke('run-tests-external'),
 
   toggleCustomHosts: (v) => ipcRenderer.invoke('toggle-custom-hosts', v),
-  checkCustomHostsUpdate: () => ipcRenderer.invoke('check-custom-hosts-update'),
   updateCustomHosts: () => ipcRenderer.invoke('update-custom-hosts'),
   setCustomHostsUrl: (url) => ipcRenderer.invoke('set-custom-hosts-url', url),
   listLists: () => ipcRenderer.invoke('list-lists'),

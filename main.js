@@ -8,7 +8,7 @@ const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, shell, clipboard }
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
-const { spawn, exec } = require('child_process');
+const { spawn, exec, execFileSync } = require('child_process');
 const net = require('net');
 const tls = require('tls');
 const crypto = require('crypto');
@@ -128,33 +128,6 @@ async function fetchCustomHostsFromRepo() {
   saveConfig();
   return lines;
 }
-// Только проверяет, есть ли в репозитории более новая версия списка —
-// сам hosts-файл и кэш не трогает (аналог "Проверить обновления" для
-// основного zapret).
-async function checkCustomHostsUpdate() {
-  sendLog('> Проверка обновлений дополнения hosts (из вашего репозитория)...');
-  try {
-    const url = customHostsSourceUrl();
-    const sep = url.includes('?') ? '&' : '?';
-    const text = await httpsGetText(url + sep + 't=' + Date.now(), 15000);
-    const lines = parseHostsLines(text);
-    if (lines.length === 0) throw new Error('пустой или некорректный файл в репозитории');
-    const remoteHash = hashLines(lines);
-    const hasUpdate = remoteHash !== config.customHostsCachedHash;
-    if (hasUpdate) {
-      sendLog(`> Доступно обновление дополнения hosts (${lines.length} строк). Нажмите «Обновить список сейчас», чтобы применить.`);
-      notify('info', 'Доступно обновление дополнения hosts.');
-    } else {
-      sendLog(`> Дополнение hosts уже в актуальном состоянии (${lines.length} строк).`);
-      notify('info', 'Дополнение hosts уже актуально.');
-    }
-    return { hasUpdate, lines: lines.length };
-  } catch (e) {
-    sendLog('[WARN] Не удалось проверить обновления дополнения hosts: ' + e.message);
-    notify('error', 'Не удалось проверить обновления дополнения hosts: ' + e.message);
-    return null;
-  }
-}
 // Выносим запись/удаление блока из hosts-файла в отдельную функцию, чтобы
 // переиспользовать её и в toggleCustomHosts(true), и при обновлении уже
 // применённого списка свежими данными из репозитория.
@@ -174,10 +147,31 @@ function applyCustomHostsBlock(lines) {
 // Скачивает свежий список из репозитория и, если блок сейчас применён в
 // hosts-файле, сразу обновляет его на месте. Если блок ещё не применён —
 // просто обновляет кэш, свежие данные подставятся при следующем включении.
+// Как и updateHostsFile() для оригинального hosts, это единая кнопка:
+// сама проверяет, есть ли обновление, и сама же его применяет — без
+// отдельного шага "проверить" перед "обновить".
 async function updateCustomHostsFile() {
-  sendLog('> Обновление дополнения hosts из репозитория...');
+  sendLog('> Проверка обновлений дополнения hosts (из вашего репозитория)...');
   try {
-    const lines = await fetchCustomHostsFromRepo();
+    const url = customHostsSourceUrl();
+    const sep = url.includes('?') ? '&' : '?';
+    const text = await httpsGetText(url + sep + 't=' + Date.now(), 15000);
+    const lines = parseHostsLines(text);
+    if (lines.length === 0) throw new Error('пустой или некорректный файл в репозитории');
+    const remoteHash = hashLines(lines);
+    const hasUpdate = remoteHash !== config.customHostsCachedHash;
+
+    if (!hasUpdate) {
+      sendLog(`> Дополнение hosts уже в актуальном состоянии (${lines.length} строк).`);
+      notify('info', 'Дополнение hosts уже актуально.');
+      return;
+    }
+
+    config.customHostsCachedText = text;
+    config.customHostsCachedHash = remoteHash;
+    config.customHostsCachedAt = Date.now();
+    saveConfig();
+
     if (customHostsApplied()) {
       applyCustomHostsBlock(lines);
       sendLog(`> Дополнение hosts обновлено в hosts-файле (${lines.length} строк).`);
@@ -187,8 +181,8 @@ async function updateCustomHostsFile() {
       notify('success', 'Список получен из репозитория и сохранён.');
     }
   } catch (e) {
-    sendLog('[ERROR] Не удалось обновить дополнение hosts: ' + e.message + ' (запустите GUI от имени администратора).');
-    notify('error', 'Не удалось обновить дополнение hosts: ' + e.message);
+    sendLog('[ERROR] Не удалось обновить дополнение hosts: ' + e.message + hostsErrorHint(e));
+    notify('error', hostsErrorNotify('Не удалось обновить дополнение hosts', e));
   }
   pushState();
 }
@@ -210,9 +204,9 @@ function setCustomHostsSourceUrl(url) {
   return { ok: true };
 }
 // Тихая автопроверка при запуске GUI (если включена галочка "Проверять
-// обновления при запуске"). В отличие от checkCustomHostsUpdate()/
-// updateCustomHostsFile() ничего не логирует и не уведомляет, если список
-// не изменился, — только когда реально появилась новая версия.
+// обновления при запуске"). В отличие от updateCustomHostsFile() ничего не
+// логирует и не уведомляет, если список не изменился, — только когда
+// реально появилась новая версия.
 async function autoCheckCustomHostsUpdate() {
   try {
     const url = customHostsSourceUrl();
@@ -355,49 +349,70 @@ function run(cmd) {
     });
   });
 }
+// Официальный hosts-блок zapret-discord-youtube (тот самый, который качает
+// updateHostsFile()) прописывает *.githubusercontent.com на один IPv6-адрес
+// (2606:50c0:8000::154) — видимо, как обход блокировок для тех, у кого есть
+// нативный IPv6. У провайдеров без поддержки IPv6 это, наоборот, полностью
+// рвёт доступ к этим доменам, включая raw.githubusercontent.com, откуда сам
+// GUI тянет обновления списков/hosts. В результате после применения hosts-
+// файла все запросы этого приложения к GitHub начинают падать по таймауту —
+// и это выглядит как "ошибка соединения", хотя на самом деле причина в
+// hosts-записи, добавленной этим же приложением. Форсируем IPv4 в наших
+// собственных запросах, чтобы эта IPv6-запись из hosts игнорировалась и
+// резолв домена шёл через обычный IPv4 DNS.
+const FORCE_IPV4_HTTPS_OPTIONS = { family: 4 };
+
 function httpsGetText(url, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { 'User-Agent': 'zapret-gui' } }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        httpsGetText(res.headers.location, timeoutMs).then(resolve, reject);
-        return;
+    const req = https.get(
+      url,
+      { headers: { 'User-Agent': 'zapret-gui' }, ...FORCE_IPV4_HTTPS_OPTIONS },
+      (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          httpsGetText(res.headers.location, timeoutMs).then(resolve, reject);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          reject(new Error('HTTP ' + res.statusCode));
+          res.resume();
+          return;
+        }
+        let data = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => (data += c));
+        res.on('end', () => resolve(data));
       }
-      if (res.statusCode !== 200) {
-        reject(new Error('HTTP ' + res.statusCode));
-        res.resume();
-        return;
-      }
-      let data = '';
-      res.setEncoding('utf8');
-      res.on('data', (c) => (data += c));
-      res.on('end', () => resolve(data));
-    });
+    );
     req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
     req.on('error', reject);
   });
 }
 function httpsGetBinary(url, timeoutMs = 60000, onProgress) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { 'User-Agent': 'zapret-gui' } }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        httpsGetBinary(res.headers.location, timeoutMs, onProgress).then(resolve, reject);
-        return;
+    const req = https.get(
+      url,
+      { headers: { 'User-Agent': 'zapret-gui' }, ...FORCE_IPV4_HTTPS_OPTIONS },
+      (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          httpsGetBinary(res.headers.location, timeoutMs, onProgress).then(resolve, reject);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          reject(new Error('HTTP ' + res.statusCode));
+          res.resume();
+          return;
+        }
+        const total = parseInt(res.headers['content-length'] || '0', 10);
+        const chunks = [];
+        let received = 0;
+        res.on('data', (chunk) => {
+          chunks.push(chunk);
+          received += chunk.length;
+          if (onProgress && total > 0) onProgress(received, total);
+        });
+        res.on('end', () => resolve(Buffer.concat(chunks)));
       }
-      if (res.statusCode !== 200) {
-        reject(new Error('HTTP ' + res.statusCode));
-        res.resume();
-        return;
-      }
-      const total = parseInt(res.headers['content-length'] || '0', 10);
-      const chunks = [];
-      let received = 0;
-      res.on('data', (chunk) => {
-        chunks.push(chunk);
-        received += chunk.length;
-        if (onProgress && total > 0) onProgress(received, total);
-      });
-      res.on('end', () => resolve(Buffer.concat(chunks)));
-    });
+    );
     req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
     req.on('error', reject);
   });
@@ -923,8 +938,8 @@ async function updateHostsFile() {
     sendLog(`> hosts-файл обновлён автоматически (${existingMatch ? 'блок обновлён' : 'блок добавлен'}, ${lines.length} строк).`);
     notify('success', 'hosts-файл обновлён автоматически.');
   } catch (e) {
-    sendLog('[ERROR] Не удалось обновить hosts-файл: ' + e.message + ' (запустите GUI от имени администратора).');
-    notify('error', 'Не удалось обновить hosts-файл — нужны права администратора.');
+    sendLog('[ERROR] Не удалось обновить hosts-файл: ' + e.message + hostsErrorHint(e));
+    notify('error', hostsErrorNotify('Не удалось обновить hosts-файл', e));
   }
 }
 function toggleAutoUpdateCheck(enable) {
@@ -945,6 +960,38 @@ function toggleAutoUpdateCheck(enable) {
     sendLog('[WARN] Не удалось продублировать флаг в utils/ (настройка в GUI всё равно сохранена): ' + e.message);
   }
   pushState();
+}
+
+// ---------- диагностика ошибок hosts-операций ----------
+// Раньше catch-блоки в updateHostsFile()/updateCustomHostsFile()/toggleCustomHosts()
+// накрывали ОДНИМ try и сетевой запрос к GitHub, и запись файла, но текст ошибки
+// всегда жёстко указывал на нехватку прав администратора — даже когда реальная
+// причина была в недоступности raw.githubusercontent.com (сеть/DNS/провайдер).
+// Различаем настоящие ошибки прав (EPERM/EACCES) от прочих (в первую очередь
+// сетевых) и показываем подсказку, соответствующую действительной причине.
+function isPermissionError(e) {
+  return !!(e && (e.code === 'EPERM' || e.code === 'EACCES'));
+}
+function isNetworkError(e) {
+  return !!(
+    e &&
+    (e.code === 'ENOTFOUND' ||
+      e.code === 'ECONNREFUSED' ||
+      e.code === 'ECONNRESET' ||
+      e.code === 'ETIMEDOUT' ||
+      e.code === 'EAI_AGAIN' ||
+      /timeout/i.test(e.message || ''))
+  );
+}
+function hostsErrorHint(e) {
+  if (isPermissionError(e)) return ' (запустите GUI от имени администратора)';
+  if (isNetworkError(e)) return ' (репозиторий на GitHub недоступен — проверьте интернет/DNS/прокси)';
+  return '';
+}
+function hostsErrorNotify(prefix, e) {
+  if (isPermissionError(e)) return `${prefix} — нужны права администратора.`;
+  if (isNetworkError(e)) return `${prefix} — не удалось подключиться к GitHub. Проверьте интернет.`;
+  return `${prefix}: ${e.message}`;
 }
 
 // ---------- Дополнение hosts от разработчика GUI ----------
@@ -1004,8 +1051,8 @@ async function toggleCustomHosts(enable) {
       notify('success', 'Дополнение hosts убрано.');
     }
   } catch (e) {
-    sendLog('[ERROR] Не удалось изменить hosts-файл: ' + e.message + ' (запустите GUI от имени администратора).');
-    notify('error', 'Не удалось изменить hosts-файл — нужны права администратора.');
+    sendLog('[ERROR] Не удалось изменить hosts-файл: ' + e.message + hostsErrorHint(e));
+    notify('error', hostsErrorNotify('Не удалось изменить hosts-файл', e));
   }
   pushState();
 }
@@ -1621,6 +1668,62 @@ function createTray() {
   updateTrayMenu(false);
 }
 
+// ---------- self-elevation (Windows) ----------
+// Манифест requestedExecutionLevel: requireAdministrator (package.json → build.win)
+// работает только для собранного .exe (NSIS/portable). При запуске через
+// `npm start` / `electron .`, из ярлыка без UAC, или в некоторых окружениях,
+// где Windows по какой-то причине не показывает UAC-запрос при старте, процесс
+// остаётся неэлевейтед — и запись в hosts-файл (updateHostsFile/toggleCustomHosts/
+// updateCustomHostsFile) падает с EPERM, что и выглядит как «нужны права
+// администратора» на скриншотах багрепортов. Проверяем реальные права в
+// рантайме и, если их нет, сами перезапускаем процесс через UAC.
+const ELEVATION_RELAUNCH_FLAG = '--zapret-elevated-relaunch';
+
+function isElevatedWin() {
+  if (!isWin) return true;
+  try {
+    // `net session` без прав администратора завершается с ошибкой — стандартный
+    // приём проверки повышенных прав без внешних зависимостей.
+    execFileSync('net', ['session'], { stdio: 'ignore' });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function relaunchElevatedAndExit() {
+  try {
+    const exePath = process.execPath;
+    // В dev-режиме (electron .) execPath указывает на electron.exe — нужно
+    // передать ему остальные argv (путь к проекту), иначе он не найдёт main.js.
+    // В собранном .exe process.argv[0] — это и есть сам exePath, лишние
+    // аргументы не нужны.
+    const baseArgs = app.isPackaged ? [] : process.argv.slice(1).filter((a) => a !== ELEVATION_RELAUNCH_FLAG);
+    const extraArgs = [...baseArgs, ELEVATION_RELAUNCH_FLAG];
+    const psArgs = extraArgs.map((a) => `'${String(a).replace(/'/g, "''")}'`).join(',');
+    const psCommand =
+      `Start-Process -FilePath '${exePath.replace(/'/g, "''")}' -ArgumentList @(${psArgs}) -Verb RunAs`;
+    const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', psCommand], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Проверяем флаг, чтобы не зациклиться, если UAC отменили или повышение
+// прав в принципе недоступно (например, отключено политиками) — тогда просто
+// продолжаем без прав, как раньше, а не перезапускаемся бесконечно.
+if (isWin && !process.argv.includes(ELEVATION_RELAUNCH_FLAG) && !isElevatedWin()) {
+  relaunchElevatedAndExit();
+  app.quit();
+  process.exit(0);
+}
+
 // ---------- app lifecycle ----------
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -1713,7 +1816,6 @@ ipcMain.handle('run-diagnostics', () => runDiagnostics());
 ipcMain.handle('run-tests', () => runStrategyTestsInline());
 ipcMain.handle('run-tests-external', () => runTests());
 ipcMain.handle('toggle-custom-hosts', (e, enable) => toggleCustomHosts(enable));
-ipcMain.handle('check-custom-hosts-update', () => checkCustomHostsUpdate());
 ipcMain.handle('update-custom-hosts', () => updateCustomHostsFile());
 ipcMain.handle('set-custom-hosts-url', (e, url) => setCustomHostsSourceUrl(url));
 ipcMain.handle('list-lists', () => listEditableFiles());

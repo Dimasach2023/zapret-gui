@@ -14,7 +14,7 @@
   },
   "devDependencies": {
     "electron": "^31.0.0",
-    "electron-builder": "^24.13.3"
+    "electron-builder": "^26.15.3"
   },
   "build": {
     "appId": "local.zapret.gui",
@@ -30,13 +30,29 @@
       "package.json"
     ],
     "extraResources": [
-      { "from": "vendor/zapret", "to": "zapret" },
-      { "from": "vendor/tg-ws-proxy/bin", "to": "tg-ws-proxy/bin" }
+      {
+        "from": "vendor/zapret",
+        "to": "zapret"
+      },
+      {
+        "from": "vendor/tg-ws-proxy/bin",
+        "to": "tg-ws-proxy/bin"
+      }
     ],
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] },
-        { "target": "portable", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "build/icon.ico",
       "requestedExecutionLevel": "requireAdministrator"
@@ -53,5 +69,9 @@
     "portable": {
       "artifactName": "ZapretGUI-portable.exe"
     }
+  },
+  "allowScripts": {
+    "electron@31.7.7": true,
+    "electron-winstaller@5.4.0": true
   }
 }
