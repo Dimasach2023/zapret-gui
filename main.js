@@ -269,7 +269,34 @@ const GAME_FILTER_FLAG = path.join(UTILS_DIR, 'game_filter.enabled');
 const ICON_PNG_PATH = path.join(__dirname, 'build', 'icon.png');
 const TRAY_ICON_PATH = path.join(__dirname, 'build', process.platform === 'win32' ? 'tray.ico' : 'tray.png');
 
-const strategies = JSON.parse(fs.readFileSync(path.join(__dirname, 'strategies.json'), 'utf-8'));
+// В strategies.json стратегии лежат в простом алфавитном порядке строк-идентификаторов,
+// из-за чего "ALT10"/"ALT11"/... оказываются между "ALT" и "ALT2" (обычная сортировка строк:
+// "ALT10" < "ALT2", т.к. сравнение посимвольное). Раньше .bat-файлы сортировались "естественно"
+// (numeric-aware) через general*.bat + Sort-Object с паддингом чисел нулями — применяем ту же
+// схему здесь, чтобы порядок в выпадающем списке стратегий, в тесте стратегий и в экспортируемом
+// для PowerShell strategies.json был предсказуемым и совпадал с логическим (general, ALT, ALT2,
+// ..., ALT9, ALT10, ..., EXP, FAKE TLS AUTO..., SIMPLE FAKE...), а не просто алфавитным.
+function naturalSortKey(s) {
+  return String(s).replace(/\d+/g, (m) => m.padStart(8, '0'));
+}
+const strategiesRaw = JSON.parse(fs.readFileSync(path.join(__dirname, 'strategies.json'), 'utf-8'));
+const strategies = [...strategiesRaw].sort((a, b) => {
+  const ka = naturalSortKey(a.id || a.name || '');
+  const kb = naturalSortKey(b.id || b.name || '');
+  return ka < kb ? -1 : ka > kb ? 1 : 0;
+});
+
+// Экспортируем актуальный strategies.json (уже в отсортированном порядке) обычным файлом
+// рядом с zapret (в utils), т.к. в собранном приложении исходный strategies.json лежит внутри
+// app.asar и недоступен внешним инструментам вроде PowerShell напрямую. Копия синхронизируется
+// при каждом запуске приложения, чтобы utils\test zapret.ps1 всегда видел тот же список
+// стратегий, в том же порядке, что и сам GUI.
+try {
+  fs.mkdirSync(UTILS_DIR, { recursive: true });
+  fs.writeFileSync(path.join(UTILS_DIR, 'strategies.json'), JSON.stringify(strategies, null, 2), 'utf-8');
+} catch (e) {
+  // Не критично: ps1-скрипт умеет искать strategies.json и по другим путям (см. Get-StrategiesJsonPath).
+}
 
 // ---------- config ----------
 const configPath = path.join(app.getPath('userData'), 'config.json');
@@ -324,7 +351,7 @@ if (loadConfigFile().autoUpdateCheck === undefined && fs.existsSync(CHECK_UPDATE
 // Фиксируем версию zapret в конфиге при первом запуске новой версии GUI,
 // а не полагаемся каждый раз на LOCAL_VERSION как запасной вариант —
 // иначе после нескольких обновлений GUI без явного обновления zapret
-// сравнение версий в checkForUpdates()/updateZapretFiles() было бы
+// сравнение версии в updateZapretFiles() было бы
 // неточным, если LOCAL_VERSION когда-нибудь разойдётся с реальной сборкой.
 if (!config.zapretVersion) {
   config.zapretVersion = LOCAL_VERSION;
@@ -778,25 +805,7 @@ function ipsetCycle() {
   pushState();
 }
 
-// ---------- Check for updates / Update IPSet / Update hosts — заменяет пункты 6,8,9,10 ----------
-async function checkForUpdates() {
-  sendLog('> Проверка обновлений...');
-  try {
-    const remote = (await httpsGetText(GITHUB_VERSION_URL)).trim();
-    if (!remote) throw new Error('пустой ответ');
-    const current = config.zapretVersion || LOCAL_VERSION;
-    if (remote === current) {
-      sendLog(`> Установлена последняя версия zapret: ${current}`);
-      notify('info', `Установлена последняя версия: ${current}`);
-    } else {
-      sendLog(`> Доступна новая версия zapret: ${remote} (у вас ${current}). Используйте кнопку «Обновить zapret» для автообновления.`);
-      notify('info', `Доступна новая версия: ${remote}. Нажмите «Обновить zapret» для автообновления.`);
-    }
-  } catch (e) {
-    sendLog('[WARN] Не удалось проверить обновления: ' + e.message);
-    notify('error', 'Не удалось проверить обновления: ' + e.message);
-  }
-}
+// ---------- Update IPSet / Update hosts ----------
 
 async function updateZapretFiles() {
   sendLog('> Получение информации о последнем релизе zapret...');
@@ -1160,58 +1169,24 @@ function replaceActiveFake(slot, sourceFile) {
   pushState();
 }
 
-// ---------- Автоподбор fake-файла (в оригинальном zapret такого нет —
-// там только ручная замена). По очереди применяет каждый кандидат,
-// перезапускает стратегию и проверяет доступность указанного хоста. ----------
+// ---------- Автоподбор fake-файла ----------
+// Fake-подбор больше не делает отдельную «TCP доступен / недоступен» проверку.
+// Он вызывает тот же test zapret.ps1 и тот же стандартный suite, что и тест
+// стратегий, но фиксирует выбранную стратегию и по очереди подменяет
+// ACTIVE_DISCORD_UDP.bin / ACTIVE_GAME_UDP.bin каждым кандидатом. Результаты
+// приходят из оригинального $analytics без пересчёта в Node.js.
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-function probeHost(host, port, timeoutMs) {
-  return new Promise((resolve) => {
-    const started = Date.now();
-    let done = false;
-    const finish = (ok, error) => {
-      if (done) return;
-      done = true;
-      try { socket.destroy(); } catch {}
-      resolve({ ok, ms: ok ? Date.now() - started : null, error });
-    };
-    let socket;
-    try {
-      if (port === 443) {
-        socket = tls.connect({ host, port, servername: host, timeout: timeoutMs, rejectUnauthorized: false });
-        socket.on('secureConnect', () => finish(true));
-      } else {
-        socket = net.connect({ host, port, timeout: timeoutMs });
-        socket.on('connect', () => finish(true));
-      }
-      socket.on('timeout', () => finish(false, 'timeout'));
-      socket.on('error', (e) => finish(false, e.message));
-    } catch (e) {
-      finish(false, e.message);
-    }
-  });
-}
 let autoPickRunning = { discord: false, game: false };
-// Общий "замок" на всё, что по очереди перезапускает общий winwsProcess в
-// цикле (автоподбор fake-файла и тест стратегий): раньше автоподбор для
-// Discord/Game и тест стратегий не знали друг о друге и могли быть запущены
-// пользователем одновременно — все они дёргают один и тот же winwsProcess,
-// что приводило бы к перепутанным логам, гонкам за startWinws()/stopWinws()
-// и подмене bin-файлов посреди чужого теста.
+
 function winwsBusyReason() {
   if (autoPickRunning.discord) return 'автоподбор fake-файла для Discord';
   if (autoPickRunning.game) return 'автоподбор fake-файла для игр';
   if (strategyTestRunning) return 'тест стратегий';
   return null;
 }
-// Общий guard для IPC-хендлеров, которые тоже трогают winwsProcess/bin-файлы
-// (старт/стоп, смена стратегии, game filter, служба, ipset, замена fake) —
-// раньше блокировка действовала только между автоподбором и тестом стратегий
-// друг относительно друга, но не мешала пользователю параллельно нажать,
-// например, «Старт»/«Стоп» или сменить стратегию посреди автоматического
-// теста, ломая ему результаты. Возвращает true, если действие нужно
-// отменить (сам guard уже отправил лог/тост с объяснением).
+
 function blockIfWinwsBusy(actionLabel) {
   const busyWith = winwsBusyReason();
   if (!busyWith) return false;
@@ -1219,103 +1194,172 @@ function blockIfWinwsBusy(actionLabel) {
   notify('error', `Сейчас выполняется «${busyWith}» — дождитесь завершения перед этим действием.`);
   return true;
 }
+
 function sendAutoPickProgress(slot, payload) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send('auto-pick-progress', { slot, ...payload });
 }
-async function autoPickFake(slot, testHost, testPort) {
-  if (autoPickRunning[slot]) return;
+
+function parseGuiPayloadLine(line) {
+  const marker = '__ZAPRET_GUI_RESULT__:';
+  if (!line || !line.startsWith(marker)) return null;
+  try {
+    return JSON.parse(Buffer.from(line.slice(marker.length), 'base64').toString('utf8'));
+  } catch (e) {
+    sendLog('[WARN] Не удалось разобрать результат fake-теста: ' + e.message);
+    return null;
+  }
+}
+
+async function autoPickFake(slot) {
+  if (autoPickRunning[slot]) return null;
   const busyWith = winwsBusyReason();
   if (busyWith) {
     sendLog(`[WARN] Автоподбор не запущен: сейчас уже выполняется «${busyWith}». Дождитесь завершения.`);
     notify('error', `Сейчас уже выполняется «${busyWith}» — дождитесь завершения.`);
-    return;
+    return null;
   }
-  autoPickRunning[slot] = true;
-  // Запоминаем, был ли winws.exe запущен до начала автоподбора — чтобы по
-  // окончании корректно вернуться в исходное состояние, а не всегда
-  // оставлять процесс висеть запущенным.
-  const wasManagedByUs = !!winwsProcess;
-  const port = parseInt(testPort, 10) || 443;
-  const host = (testHost || '').trim() || 'discord.com';
-  const targetName = slot === 'discord' ? 'ACTIVE_DISCORD_UDP.bin' : 'ACTIVE_GAME_UDP.bin';
-  const target = bin(targetName);
+  if (!isWin) {
+    sendLog('[ERROR] Автоподбор fake доступен только на Windows.');
+    notify('error', 'Автоподбор fake доступен только на Windows.');
+    return null;
+  }
+
+  const script = path.join(UTILS_DIR, 'test zapret.ps1');
+  if (!fs.existsSync(script)) {
+    sendLog('[ERROR] utils\\test zapret.ps1 не найден.');
+    notify('error', 'utils\\test zapret.ps1 не найден.');
+    return null;
+  }
+
+  const strategy = currentStrategy();
+    autoPickRunning[slot] = true;
+  pushState();
 
   try {
-    const svc = await queryServiceState(SERVICE_NAME);
-    if (svc === 'RUNNING') {
-      sendLog('[WARN] Служба "zapret" установлена и работает — она может мешать автоподбору (перезапускать winws параллельно с тестами). Рекомендуется сначала удалить службу.');
-    }
+    const targetName = slot === 'discord' ? 'ACTIVE_DISCORD_UDP.bin' : 'ACTIVE_GAME_UDP.bin';
+    sendLog(`> === Полный автоподбор fake (${targetName}) ===`);
+    sendLog(`> Стратегия: ${strategy.name}`);
+    sendLog('> Проверка выполняется тем же PowerShell suite, что и тест стратегий; статистика берётся из $analytics.');
 
+    // Повторяем естественный порядок кандидатов, чтобы прогресс в GUI был стабильным.
     const candidates = listBinFiles().filter(
       (f) => f !== 'ACTIVE_DISCORD_UDP.bin' && f !== 'ACTIVE_GAME_UDP.bin'
     );
-    if (candidates.length === 0) {
+    if (!candidates.length) {
       sendLog('[ERROR] Нет доступных .bin файлов для перебора.');
       notify('error', 'Нет доступных .bin файлов для перебора.');
-      return;
+      return null;
     }
 
-    let original = null;
-    try {
-      original = fs.existsSync(target) ? fs.readFileSync(target) : null;
-    } catch {}
+    sendAutoPickProgress(slot, { index: 0, total: candidates.length, name: strategy.name, status: 'start' });
+    notify('info', `Запущен полноценный автоподбор ${slot === 'discord' ? 'Discord' : 'Game'}: ${candidates.length} fake-файлов.`);
 
-    sendLog(`> === Автоподбор fake (${targetName}), проверка: ${host}:${port} ===`);
-    notify('info', `Автоподбор запущен: перебор ${candidates.length} файлов, проверка ${host}:${port}...`);
-
-    const results = [];
-    for (let i = 0; i < candidates.length; i++) {
-      const file = candidates[i];
-      sendAutoPickProgress(slot, { index: i + 1, total: candidates.length, file, status: 'testing' });
-      try {
-        fs.copyFileSync(bin(file), target);
-      } catch (e) {
-        sendLog(`  [FAIL] ${file}: не удалось скопировать (${e.message})`);
-        results.push({ file, ok: false });
-        continue;
+    let stdoutBuffer = '';
+    let payload = null;
+    let settled = false;
+    const child = spawn(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', script,
+        '-GuiMode',
+        '-TestType', 'fake',
+        '-RunMode', 'all',
+        '-FakeSlot', slot,
+        '-StrategyId', strategy.id,
+      ],
+      {
+        cwd: ZAPRET_ROOT,
+        windowsHide: true,
+        env: { ...process.env, NO_UPDATE_CHECK: '1' },
       }
-      await startWinws();
-      await delay(1600); // дать winws/драйверу подняться
-      const res = await probeHost(host, port, 4000);
-      results.push({ file, ok: res.ok, ms: res.ms });
-      sendLog(`  ${res.ok ? '[OK]' : '[FAIL]'} ${file}${res.ok ? ` — ${res.ms} мс` : res.error ? ` — ${res.error}` : ''}`);
-      sendAutoPickProgress(slot, { index: i + 1, total: candidates.length, file, status: res.ok ? 'ok' : 'fail', ms: res.ms });
+    );
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+
+    const consumeLines = (text) => {
+      stdoutBuffer += text;
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() || '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const parsed = parseGuiPayloadLine(trimmed);
+        if (parsed) { payload = parsed; continue; }
+        sendLog(trimmed);
+        const m = trimmed.match(/^\s*\[(\d+)\/(\d+)\]\s+(.+?)\s*$/);
+        if (m) {
+          sendAutoPickProgress(slot, {
+            index: Number(m[1]),
+            total: Number(m[2]) || candidates.length,
+            file: m[3],
+            status: 'testing',
+          });
+        }
+      }
+    };
+
+    child.stdout.on('data', (chunk) => consumeLines(chunk.toString()));
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString().trim();
+      if (text) sendLog('[PS-WARN] ' + text);
+    });
+
+    const result = await new Promise((resolve) => {
+      child.on('error', (err) => {
+        sendLog('[ERROR] Не удалось запустить PowerShell-тестер: ' + err.message);
+        notify('error', 'Не удалось запустить PowerShell-тестер для fake.');
+        resolve(null);
+      });
+      child.on('close', (code) => {
+        if (stdoutBuffer.trim()) consumeLines(stdoutBuffer + '\n');
+        if (code !== 0 || !payload) {
+          sendLog(`> === Автоподбор fake завершён с ошибкой (код ${code ?? 'unknown'}) ===`);
+          notify('error', 'Автоподбор fake завершился с ошибкой. Подробности смотрите в журнале.');
+          resolve(null);
+          return;
+        }
+        resolve(payload);
+      });
+    });
+
+    if (!result) return null;
+
+    const analytics = result.analytics && typeof result.analytics === 'object' ? result.analytics : {};
+    const rawResults = Array.isArray(result.results) ? result.results : [];
+    const normalized = rawResults.map((r) => {
+      const file = String(r.FakeFile || r.Config || r.Name || '');
+      const a = analytics[r.Config] || analytics[file] || {};
+      const score = Number(a.OK) || 0;
+      const pingOK = Number(a.PingOK) || 0;
+      return { file, analytics: a, score, pingOK, raw: r };
+    }).filter((r) => r.file);
+
+    // При равном HTTP-результате выигрывает вариант с большим количеством
+    // успешных ping, то есть используется тот же критерий, что у PS1.
+    normalized.sort((a, b) => (b.score - a.score) || (b.pingOK - a.pingOK) || a.file.localeCompare(b.file));
+    const best = normalized.length ? normalized[0].file : null;
+
+    for (let i = 0; i < normalized.length; i++) {
+      const r = normalized[i];
+      sendAutoPickProgress(slot, {
+        index: i + 1,
+        total: normalized.length,
+        file: r.file,
+        status: 'ok',
+        stats: r.analytics,
+      });
     }
 
-    const successful = results.filter((r) => r.ok).sort((a, b) => a.ms - b.ms);
-    const best = successful[0] || null;
-
-    // Раньше автоподбор сам, без единого явного действия пользователя,
-    // копировал "лучший" файл в ACTIVE_*.bin и перезапускал winws — заметить
-    // это можно было только по мелькнувшему тосту (5 сек) или по журналу,
-    // никакой постоянной пометки "вот что выбрано и почему" не было, а
-    // применялось всё автоматически, без кнопки "Применить".
-    // Теперь автоподбор ничего не применяет сам: он всегда возвращает
-    // тестируемый .bin-файл в то состояние, что было до теста, и отдаёт
-    // в интерфейс полный ранжированный список результатов (панель ниже,
-    // как у теста стратегий) — лучший вариант там явно подсвечен и
-    // предлагается кнопкой «Применить», как при ручном выборе.
-    if (original) {
-      fs.writeFileSync(target, original);
-    } else {
-      sendLog('[WARN] Исходного active fake-файла не было — оставляю последний протестированный до явного выбора через «Применить».');
-    }
-    if (wasManagedByUs) await startWinws();
-    else await stopWinws();
-
-    if (best) {
-      sendLog(`> Лучший результат: ${best.file} (${best.ms} мс из ${successful.length} успешных). Выберите его в списке и нажмите «Применить», чтобы использовать.`);
-      notify('success', `Автоподбор завершён. Лучший файл — ${best.file} (${best.ms} мс) — выберите и нажмите «Применить».`);
-    } else {
-      sendLog('> Ни один файл не прошёл проверку. Ничего не изменено.');
-      notify('error', 'Ни один файл не прошёл проверку — ничего не применено.');
-    }
-    sendLog('> === Автоподбор завершён ===');
-    sendLog('  Учтите: это эвристическая проверка доступности хоста, а не гарантия обхода блокировки — итоговый выбор стоит перепроверить в самом приложении (Discord/игра).');
-    const sorted = [...results].sort((a, b) => (b.ok - a.ok) || ((a.ms ?? Infinity) - (b.ms ?? Infinity)));
-    sendAutoPickProgress(slot, { status: 'finished', results: sorted, best: best ? best.file : null });
-    return { best: best ? best.file : null, results: sorted };
+    sendAutoPickProgress(slot, { status: 'finished', results: normalized, best });
+    sendLog(`> Лучший fake: ${best || 'нет результата'}`);
+    sendLog('> Активный fake автоматически НЕ изменён. Выберите файл в результатах и нажмите «Применить».');
+    notify(best ? 'success' : 'error', best ? `Автоподбор завершён. Лучший fake: ${best}.` : 'Не удалось определить лучший fake.');
+    return { best, results: normalized, analytics, strategy: strategy.name };
   } finally {
     autoPickRunning[slot] = false;
     pushState();
@@ -1381,108 +1425,264 @@ function runTests() {
   exec(`start "" powershell -NoProfile -ExecutionPolicy Bypass -File "${script}"`, { cwd: ZAPRET_ROOT });
 }
 
-// ---------- Тест стратегий прямо в приложении (без внешнего окна PowerShell) ----------
-// В отличие от utils\test zapret.ps1 (который ищет general*.bat в корне zapret —
-// а в этой сборке стратегии хранятся не в .bat, а в strategies.json), тестер ниже
-// перебирает стратегии из strategies.json напрямую: по очереди запускает winws.exe
-// с аргументами каждой стратегии и проверяет TLS-доступность набора целевых хостов
-// (той же функцией probeHost, что и в автоподборе fake-файлов).
-const STRATEGY_TEST_TARGETS = [
-  { name: 'Discord Main', host: 'discord.com' },
-  { name: 'Discord Gateway', host: 'gateway.discord.gg' },
-  { name: 'Discord CDN', host: 'cdn.discordapp.com' },
-  { name: 'YouTube', host: 'www.youtube.com' },
-  { name: 'YouTube Redirect', host: 'redirector.googlevideo.com' },
-  { name: 'Google', host: 'www.google.com' },
-];
+// ---------- Тест стратегий прямо в приложении ----------
+// Внутренняя кнопка теперь использует ТОТ ЖЕ PowerShell-движок, что и
+// «Тесты во внешнем PowerShell». Это убирает расхождение между двумя тестерами:
+// полный targets.txt, HTTP/1.1 + TLS1.2 + TLS1.3, ping, параллельные проверки,
+// ipset-логика, восстановление winws и итоговая аналитика работают одинаково.
+// Единственная разница — GUI запускает скрипт скрыто и забирает его результат
+// через специальную однострочную метку.
 let strategyTestRunning = false;
+
 function sendStrategyTestProgress(payload) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send('strategy-test-progress', payload);
 }
-async function runStrategyTestsInline() {
-  if (strategyTestRunning) {
-    sendLog('[WARN] Тест стратегий уже выполняется.');
-    return null;
-  }
-  const busyWith = winwsBusyReason();
-  if (busyWith) {
-    sendLog(`[WARN] Тест стратегий не запущен: сейчас уже выполняется «${busyWith}». Дождитесь завершения.`);
-    notify('error', `Сейчас уже выполняется «${busyWith}» — дождитесь завершения.`);
-    return null;
-  }
-  if (!isWin) {
-    sendLog('[ERROR] Тест стратегий доступен только на Windows.');
-    notify('error', 'Тест стратегий доступен только на Windows.');
-    return null;
-  }
-  if (!fs.existsSync(WINWS_EXE)) {
-    sendLog('[ERROR] Не найден bin\\winws.exe внутри приложения.');
-    notify('error', 'Не найден bin\\winws.exe внутри приложения.');
-    return null;
-  }
-  const svc = await queryServiceState(SERVICE_NAME);
-  if (svc === 'RUNNING') {
-    sendLog('[WARN] Служба "zapret" установлена и работает — она может мешать тесту (перезапускать winws параллельно). Рекомендуется сначала удалить службу.');
-  }
 
-  strategyTestRunning = true;
-  const originalStrategyId = config.strategyId;
-  const wasManagedByUs = !!winwsProcess;
-  const total = strategies.length;
-  sendLog(`> === Тест стратегий (в приложении): ${total} шт., ${STRATEGY_TEST_TARGETS.length} целей на каждую ===`);
-  notify('info', `Запущен тест ${total} стратегий — это может занять пару минут.`);
-  sendStrategyTestProgress({ index: 0, total, name: '', status: 'start' });
+function normalizePsResultPayload(payload) {
+  const rawResults = Array.isArray(payload?.results)
+    ? payload.results
+    : payload?.results
+      ? [payload.results]
+      : [];
 
-  const results = [];
-  try {
-    for (let i = 0; i < strategies.length; i++) {
-      const s = strategies[i];
-      sendStrategyTestProgress({ index: i + 1, total, name: s.name, status: 'testing' });
-      config.strategyId = s.id; // не сохраняем в config.json — это только для теста
-      await startWinws();
-      await delay(1800); // дать winws/драйверу подняться
-      const perTarget = await Promise.all(
-        STRATEGY_TEST_TARGETS.map(async (t) => {
-          const res = await probeHost(t.host, 443, 4000);
-          return { name: t.name, ok: res.ok, ms: res.ms };
-        })
-      );
-      const ok = perTarget.filter((r) => r.ok).length;
-      results.push({ id: s.id, name: s.name, ok, total: STRATEGY_TEST_TARGETS.length, perTarget });
-      sendLog(`  [${ok}/${STRATEGY_TEST_TARGETS.length}] ${s.name}`);
-      sendStrategyTestProgress({ index: i + 1, total, name: s.name, status: 'done', ok, targetsTotal: STRATEGY_TEST_TARGETS.length });
+  // Стандартный режим внешнего теста:
+  // Config/Type/Results -> id/name/ok/total + подробности по каждому target.
+  return rawResults
+    .filter((r) => r && r.Config)
+    .map((r) => {
+      const targets = Array.isArray(r.Results) ? r.Results : r.Results ? [r.Results] : [];
+      const perTarget = targets.map((t) => {
+        const tokens = Array.isArray(t.HttpTokens)
+          ? t.HttpTokens.map((v) => String(v).trim()).filter(Boolean)
+          : t.HttpTokens
+            ? [String(t.HttpTokens).trim()]
+            : [];
+
+        const httpTokens = tokens.filter((token) => /^(HTTP|TLS1\.2|TLS1\.3):/i.test(token));
+        const httpOk = httpTokens.filter((token) => /:OK\b/i.test(token)).length;
+        const httpTotal = httpTokens.length;
+        return {
+          name: String(t.Name || t.name || 'Unknown'),
+          ok: httpOk > 0,
+          httpOk,
+          httpTotal,
+          ping: String(t.PingResult || 'n/a'),
+          httpTokens,
+          isUrl: !!t.IsUrl,
+        };
+      });
+
+      const ok = perTarget.reduce((sum, t) => sum + (Number(t.httpOk) || 0), 0);
+      const total = perTarget.reduce((sum, t) => sum + (Number(t.httpTotal) || 0), 0);
+      return {
+        id: String(r.Id || r.Config),
+        name: String(r.Config),
+        ok,
+        total,
+        type: String(r.Type || 'standard'),
+        perTarget,
+      };
+    });
+}
+
+function runStrategyTestsInline() {
+  return new Promise((resolve) => {
+    if (strategyTestRunning) {
+      sendLog('[WARN] Тест стратегий уже выполняется.');
+      resolve(null);
+      return;
     }
-  } catch (e) {
-    sendLog('[ERROR] Тест стратегий прерван: ' + e.message);
-  } finally {
-    config.strategyId = originalStrategyId;
-    // Раньше startWinws()/stopWinws() здесь не дожидались (не было await),
-    // из-за чего pushState() ниже мог отправить в интерфейс состояние ДО
-    // того, как процесс реально остановился/перезапустился — winws.exe
-    // выглядел как "не останавливающийся" после завершения теста.
-    if (wasManagedByUs) {
-      await startWinws();
-    } else {
-      await stopWinws();
+
+    const busyWith = winwsBusyReason();
+    if (busyWith) {
+      sendLog(`[WARN] Тест стратегий не запущен: сейчас уже выполняется «${busyWith}». Дождитесь завершения.`);
+      notify('error', `Сейчас уже выполняется «${busyWith}» — дождитесь завершения.`);
+      resolve(null);
+      return;
     }
-    strategyTestRunning = false;
+
+    if (!isWin) {
+      sendLog('[ERROR] Тест стратегий доступен только на Windows.');
+      notify('error', 'Тест стратегий доступен только на Windows.');
+      resolve(null);
+      return;
+    }
+
+    const script = path.join(UTILS_DIR, 'test zapret.ps1');
+    if (!fs.existsSync(script)) {
+      sendLog('[ERROR] utils\\test zapret.ps1 не найден.');
+      notify('error', 'utils\\test zapret.ps1 не найден.');
+      resolve(null);
+      return;
+    }
+
+    if (!fs.existsSync(WINWS_EXE)) {
+      sendLog('[ERROR] Не найден bin\\winws.exe внутри приложения.');
+      notify('error', 'Не найден bin\\winws.exe внутри приложения.');
+      resolve(null);
+      return;
+    }
+
+    strategyTestRunning = true;
     pushState();
-  }
+    const total = strategies.length;
 
-  const sorted = [...results].sort((a, b) => b.ok - a.ok);
-  sendLog('> === Тест стратегий завершён ===');
-  const best = sorted[0];
-  if (best && best.ok > 0) {
-    sendLog(`> Лучший результат: «${best.name}» (${best.ok}/${best.total}).`);
-    notify('success', `Тест завершён. Лучшая стратегия: «${best.name}» (${best.ok}/${best.total}).`);
-  } else {
-    sendLog('> Ни одна стратегия не прошла проверку целей.');
-    notify('error', 'Тест завершён — ни одна стратегия не прошла проверку.');
-  }
-  sendLog('  Учтите: это эвристическая проверка доступности хостов, а не гарантия обхода блокировки в Discord/игре/браузере.');
-  sendStrategyTestProgress({ index: total, total, name: '', status: 'finished', results: sorted });
-  return sorted;
+    sendLog(`> === Полный тест стратегий: ${total} конфигураций ===`);
+    sendLog('> Используется тот же движок, что и во внешнем PowerShell.');
+    notify('info', `Запущен полный тест ${total} стратегий.`);
+    sendStrategyTestProgress({ index: 0, total, name: '', status: 'start' });
+
+    let stdoutBuffer = '';
+    let resultPayload = null;
+    let settled = false;
+
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      strategyTestRunning = false;
+      pushState();
+      resolve(value);
+    };
+
+    // Удаляем старый GUI-результат, чтобы не принять его за результат нового запуска.
+    const child = spawn(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        script,
+        '-GuiMode',
+        '-TestType',
+        'standard',
+        '-RunMode',
+        'all',
+      ],
+      {
+        cwd: ZAPRET_ROOT,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          NO_UPDATE_CHECK: '1',
+        },
+      }
+    );
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      stdoutBuffer += text;
+
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        if (trimmed.startsWith('__ZAPRET_GUI_RESULT__:')) {
+          try {
+            const b64 = trimmed.slice('__ZAPRET_GUI_RESULT__:'.length);
+            resultPayload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+          } catch (e) {
+            sendLog('[WARN] Не удалось разобрать результат теста: ' + e.message);
+          }
+          continue;
+        }
+
+        // Показываем вывод оригинального тестера прямо в журнале GUI.
+        sendLog(trimmed);
+
+        // Живая индикация прогресса по тем же конфигурациям, что печатает PS1.
+        const m = trimmed.match(/^\s*\[(\d+)\/(\d+)\]\s+(.+?)\s*$/);
+        if (m) {
+          const index = Number(m[1]);
+          const all = Number(m[2]);
+          const name = m[3];
+          sendStrategyTestProgress({ index, total: all || total, name, status: 'testing' });
+        }
+      }
+    });
+
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString().trim();
+      if (text) sendLog('[PS-WARN] ' + text);
+    });
+
+    child.on('error', (err) => {
+      sendLog('[ERROR] Не удалось запустить PowerShell-тестер: ' + err.message);
+      notify('error', 'Не удалось запустить тестер PowerShell.');
+      finish(null);
+    });
+
+    child.on('close', (code) => {
+      if (stdoutBuffer.trim()) {
+        for (const line of stdoutBuffer.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          if (trimmed.startsWith('__ZAPRET_GUI_RESULT__:')) {
+            try {
+              const b64 = trimmed.slice('__ZAPRET_GUI_RESULT__:'.length);
+              resultPayload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+            } catch (e) {
+              sendLog('[WARN] Не удалось разобрать результат теста: ' + e.message);
+            }
+          } else {
+            sendLog(trimmed);
+          }
+        }
+      }
+
+      if (code !== 0 || !resultPayload) {
+        sendLog(`> === Тест стратегий завершён с ошибкой (код ${code ?? 'unknown'}) ===`);
+        notify('error', 'Тест стратегий завершился с ошибкой. Подробности смотрите в журнале.');
+        finish(null);
+        return;
+      }
+
+      const results = normalizePsResultPayload(resultPayload);
+
+      // Сохраняем стабильный порядок strategies.json, но лучшую стратегию
+      // определяем отдельно — так же, как делает оригинальный PS1.
+      const byId = new Map(results.map((r) => [r.id, r]));
+      const ordered = strategies.map((s) => byId.get(s.id) || {
+        id: s.id,
+        name: s.name,
+        ok: 0,
+        total: 0,
+        type: 'standard',
+        perTarget: [],
+      });
+
+      const bestName = String(resultPayload.best || '');
+      sendStrategyTestProgress({
+        index: total,
+        total,
+        name: '',
+        status: 'finished',
+        results: ordered,
+        analytics: resultPayload.analytics || {},
+        best: bestName,
+        resultFile: resultPayload.resultFile || '',
+      });
+
+      if (bestName) {
+        sendLog(`> === Тест стратегий завершён ===`);
+        sendLog(`> Лучшая стратегия: «${bestName}».`);
+        notify('success', `Тест завершён. Лучшая стратегия: «${bestName}».`);
+      } else {
+        sendLog('> === Тест стратегий завершён ===');
+        sendLog('> Ни одна стратегия не прошла проверку.');
+        notify('error', 'Тест завершён — ни одна стратегия не прошла проверку.');
+      }
+
+      finish(ordered);
+    });
+  });
 }
 
 // ---------- autostart app (Task Scheduler, без UAC при каждом входе) ----------
@@ -1799,7 +1999,6 @@ ipcMain.handle('service-remove', () => {
   return serviceRemove();
 });
 ipcMain.handle('ipset-cycle', () => ipsetCycle());
-ipcMain.handle('check-updates', () => checkForUpdates());
 ipcMain.handle('update-zapret-files', () => {
   if (blockIfWinwsBusy('Обновление zapret')) return;
   return updateZapretFiles();

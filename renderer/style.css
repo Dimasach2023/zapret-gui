@@ -443,6 +443,17 @@ select { cursor: pointer; }
 .strategy-test-results td.score { text-align: right; white-space: nowrap; }
 .strategy-test-results tr { cursor: pointer; }
 .strategy-test-results tr:hover td { color: var(--accent); }
+.strategy-test-table th { padding: 4px 6px; text-align: left; font-weight: 600; color: var(--text-dim, #aaa); }
+.strategy-test-table th:last-child { text-align: right; }
+.strategy-test-table td.score { font-size: 13px; font-weight: 700; }
+.strategy-name { font-weight: 600; }
+.strategy-targets { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 2px 10px; margin-top: 3px; }
+.strategy-target { font-size: 10.5px; font-weight: 400; color: var(--text-dim, #aaa); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.strategy-target span { display: inline-block; width: 14px; font-weight: 700; }
+.strategy-target.target-ok { color: var(--green, #5bd18b); }
+.strategy-target.target-fail { color: var(--red, #ef6b73); }
+.strategy-target small { opacity: .75; }
+.strategy-test-footnote { margin-top: 8px; }
 
 /* ---------- кастомный скроллбар (вместо дефолтного браузерного) ---------- */
 /* Firefox */
@@ -488,3 +499,26 @@ select { cursor: pointer; }
 .list-editor::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+
+/* ---------- strategy test results ---------- */
+.strategy-test-results { margin-top: 10px; }
+.strategy-test-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.strategy-test-table th,
+.strategy-test-table td { padding: 8px 9px; border-bottom: 1px solid var(--border); vertical-align: top; text-align: left; }
+.strategy-test-table th { color: var(--muted); font-weight: 600; }
+.strategy-test-table tr { cursor: pointer; }
+.strategy-test-table tr:hover { background: rgba(255,255,255,.025); }
+.strategy-test-table tr.best { background: rgba(80,180,255,.07); box-shadow: inset 3px 0 0 var(--accent); }
+.strategy-test-table td.score { width: 75px; white-space: nowrap; font-weight: 700; }
+.strategy-name { font-weight: 600; margin-bottom: 5px; }
+.strategy-targets { display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 4px 8px; }
+.strategy-target { border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; line-height: 1.25; background: rgba(0,0,0,.08); }
+.strategy-target > span { display: inline-block; width: 16px; font-weight: 700; }
+.strategy-target small { color: var(--muted); margin-left: 3px; }
+.strategy-target.target-ok { border-color: rgba(80,200,130,.35); }
+.strategy-target.target-partial { border-color: rgba(240,190,70,.35); }
+.strategy-target.target-unsupported { border-color: rgba(240,170,70,.35); }
+.strategy-target.target-fail { border-color: rgba(220,90,90,.35); }
+.strategy-test-footnote { margin-top: 7px; color: var(--muted); line-height: 1.45; font-size: 11.5px; }
+.strategy-test-footnote code { font-family: Consolas, monospace; }

@@ -1,10 +1,125 @@
+﻿[CmdletBinding()]
+param(
+    [switch]$GuiMode,
+    [ValidateSet('standard','dpi','fake')]
+    [string]$TestType = 'standard',
+    [ValidateSet('all','select')]
+    [string]$RunMode = 'all',
+    [ValidateSet('discord','game')]
+    [string]$FakeSlot = 'discord',
+    [string]$StrategyId = ''
+)
+
+# Electron получает stdout через pipe. В Windows PowerShell 5.1 кодировка вывода
+# по умолчанию зависит от системной OEM-страницы, из-за чего русские названия
+# превращаются в кракозябры. В GUI-режиме принудительно отдаём UTF-8 без BOM.
+if ($GuiMode) {
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [Console]::OutputEncoding = $utf8
+        $OutputEncoding = $utf8
+    } catch {
+        # Сам тест от этого не должен падать — результат всё равно передаётся Base64/UTF-8.
+    }
+}
+
 $hasErrors = $false
 
 $rootDir = Split-Path $PSScriptRoot
 $listsDir = Join-Path $rootDir "lists"
 $utilsDir = Join-Path $rootDir "utils"
+$binDir = Join-Path $rootDir "bin"
+$winwsExe = Join-Path $binDir "winws.exe"
 $resultsDir = Join-Path $utilsDir "test results"
 if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsDir | Out-Null }
+
+# ---------- strategies.json support ----------
+# Эта сборка GUI хранит стратегии не в general*.bat, а в strategies.json (формат:
+# массив {id, name, args[]}, где args могут содержать плейсхолдеры {{BIN}}, {{LISTS}},
+# {{GFTCP}}, {{GFUDP}} — их подставляет main.js в buildArgs()). Ищем этот файл в
+# нескольких местах, чтобы скрипт работал и из исходников, и из установленной сборки.
+function Get-StrategiesJsonPath {
+    $candidates = @(
+        (Join-Path $utilsDir "strategies.json"),                                  # копия, экспортируемая main.js при каждом запуске приложения (актуальна всегда)
+        (Join-Path $rootDir "strategies.json"),                                    # на случай ручного копирования рядом с zapret
+        (Join-Path (Split-Path -Parent (Split-Path -Parent $rootDir)) "strategies.json")  # dev-раскладка: <repo>/strategies.json (rootDir = <repo>/vendor/zapret)
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { return $c }
+    }
+    return $null
+}
+
+function Get-GameFilterMode {
+    $flag = Join-Path $utilsDir "game_filter.enabled"
+    if (Test-Path $flag) {
+        $mode = (Get-Content -Path $flag -Raw -ErrorAction SilentlyContinue).Trim()
+        if ($mode -in @('off', 'tcp', 'udp', 'all')) { return $mode }
+    }
+    return 'off'
+}
+
+function Get-GameFilterValues {
+    param([string]$mode)
+    switch ($mode) {
+        'all' { return @{ TCP = '1024-65535'; UDP = '1024-65535' } }
+        'tcp' { return @{ TCP = '1024-65535'; UDP = '12' } }
+        'udp' { return @{ TCP = '12'; UDP = '1024-65535' } }
+        default { return @{ TCP = '12'; UDP = '12' } }
+    }
+}
+
+# Подставляет плейсхолдеры в args стратегии — та же логика, что buildArgs() в main.js
+function Build-WinwsArgs {
+    param($strategy, [string]$binPrefix, [string]$listsPrefix, [string]$gftcp, [string]$gfudp)
+    return @($strategy.args | ForEach-Object {
+        $_.Replace('{{BIN}}', $binPrefix).Replace('{{LISTS}}', $listsPrefix).Replace('{{GFTCP}}', $gftcp).Replace('{{GFUDP}}', $gfudp)
+    })
+}
+
+# Аргументы стратегии содержат абсолютные пути (bin/lists), а установка часто лежит
+# под "C:\Program Files\..." — с пробелом в пути. Start-Process -ArgumentList с
+# массивом строк НЕ квотирует элементы с пробелами сам по себе (просто склеивает их
+# через пробел), из-за чего winws.exe получил бы разорванные пополам аргументы.
+# Поэтому собираем единую командную строку вручную, по тем же правилам квотирования,
+# что использует Windows (CommandLineToArgvW): оборачиваем в кавычки только то, что
+# содержит пробел/кавычку, и корректно экранируем обратные слэши перед кавычками.
+function ConvertTo-QuotedArg {
+    param([string]$arg)
+    if ($arg -ne '' -and ($arg -notmatch '[\s"]')) { return $arg }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $backslashes = 0
+    foreach ($ch in $arg.ToCharArray()) {
+        if ($ch -eq '\') {
+            $backslashes++
+            [void]$sb.Append('\')
+        } elseif ($ch -eq '"') {
+            for ($i = 0; $i -lt $backslashes; $i++) { [void]$sb.Append('\') }
+            [void]$sb.Append('\"')
+            $backslashes = 0
+        } else {
+            $backslashes = 0
+            [void]$sb.Append($ch)
+        }
+    }
+    for ($i = 0; $i -lt $backslashes; $i++) { [void]$sb.Append('\') }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function Build-CommandLine {
+    param([string[]]$argsArray)
+    return ($argsArray | ForEach-Object { ConvertTo-QuotedArg $_ }) -join ' '
+}
+
+# В strategies.json стратегии лежат в простом алфавитном порядке строк ("ALT10" раньше "ALT2",
+# т.к. сравнение посимвольное) — сортируем "естественно" (числа сравниваются как числа), той же
+# схемой, что и main.js: паддинг числовых последовательностей нулями перед сравнением строк.
+function Get-NaturalSortKey {
+    param([string]$s)
+    return [Regex]::Replace($s, '(\d+)', { $args[0].Value.PadLeft(8, '0') })
+}
 
 # Define functions early
 function Get-IpsetStatus {
@@ -389,10 +504,89 @@ if ($hasErrors) {
 
 $dpiTargets = @()
 
-# Config
-$targetDir = $rootDir
-if (-not $targetDir) { $targetDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
-$batFiles = Get-ChildItem -Path $targetDir -Filter "*.bat" | Where-Object { $_.Name -notlike "service*" } | Sort-Object { [Regex]::Replace($_.Name, "(\d+)", { $args[0].Value.PadLeft(8, "0") }) }
+# Config: стратегии берём из strategies.json (не из general*.bat — в этой сборке
+# .bat-файлов нет, все стратегии описаны в JSON и запускаются winws.exe напрямую).
+$strategiesJsonPath = Get-StrategiesJsonPath
+if (-not $strategiesJsonPath) {
+    Write-Host "[ERROR] strategies.json not found (searched next to utils, zapret root and repo root)" -ForegroundColor Red
+    Write-Host "Press any key to exit..." -ForegroundColor Yellow
+    [void][System.Console]::ReadKey($true)
+    exit 1
+}
+if (-not (Test-Path $winwsExe)) {
+    Write-Host "[ERROR] bin\winws.exe not found at $winwsExe" -ForegroundColor Red
+    Write-Host "Press any key to exit..." -ForegroundColor Yellow
+    [void][System.Console]::ReadKey($true)
+    exit 1
+}
+
+Write-Host "[INFO] Using strategies.json: $strategiesJsonPath" -ForegroundColor Gray
+
+$strategiesRaw = Get-Content -Path $strategiesJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$strategiesRaw = @($strategiesRaw | Sort-Object { Get-NaturalSortKey ($_.id) })
+$gfMode = Get-GameFilterMode
+$gfValues = Get-GameFilterValues -mode $gfMode
+Write-Host "[INFO] Game filter mode: $gfMode (TCP=$($gfValues.TCP) UDP=$($gfValues.UDP))" -ForegroundColor Gray
+
+$binPrefix = $binDir.TrimEnd('\') + '\'
+$listsPrefix = $listsDir.TrimEnd('\') + '\'
+
+$batFiles = @($strategiesRaw | ForEach-Object {
+    $builtArgs = Build-WinwsArgs -strategy $_ -binPrefix $binPrefix -listsPrefix $listsPrefix -gftcp $gfValues.TCP -gfudp $gfValues.UDP
+    [PSCustomObject]@{
+        Name        = $_.name
+        Id          = $_.id
+        Args        = $builtArgs
+        CommandLine = Build-CommandLine -argsArray $builtArgs
+        FakeFile    = $null
+    }
+})
+
+# Fake-подбор использует ровно тот же стандартный тестовый движок, но вместо
+# перебора 22 стратегий фиксирует выбранную стратегию и по очереди подменяет
+# ACTIVE_*.bin каждым кандидатом. Поэтому HTTP/TLS/ping-проверки, параллельность,
+# таймауты, аналитика и восстановление состояния полностью совпадают с обычным
+# тестом стратегий.
+$fakeTargetName = $null
+$fakeOriginalBytes = $null
+if ($testType -eq 'fake') {
+    if (-not $StrategyId) {
+        throw 'Для TestType=fake не передан StrategyId.'
+    }
+    $selectedStrategy = $strategiesRaw | Where-Object { $_.id -eq $StrategyId } | Select-Object -First 1
+    if (-not $selectedStrategy) {
+        throw "Стратегия '$StrategyId' не найдена в strategies.json."
+    }
+
+    if ($FakeSlot -eq 'game') {
+        $fakeTargetName = 'ACTIVE_GAME_UDP.bin'
+    } else {
+        $fakeTargetName = 'ACTIVE_DISCORD_UDP.bin'
+    }
+    $fakeTargetPath = Join-Path $binDir $fakeTargetName
+    if (Test-Path $fakeTargetPath) {
+        $fakeOriginalBytes = [IO.File]::ReadAllBytes($fakeTargetPath)
+    }
+
+    $fakeCandidates = @(Get-ChildItem -LiteralPath $binDir -Filter '*.bin' -File |
+        Where-Object { $_.Name -notin @('ACTIVE_DISCORD_UDP.bin','ACTIVE_GAME_UDP.bin') } |
+        Sort-Object Name)
+    if ($fakeCandidates.Count -eq 0) {
+        throw 'В bin не найдено ни одного fake .bin файла для перебора.'
+    }
+
+    $selectedArgs = Build-WinwsArgs -strategy $selectedStrategy -binPrefix $binPrefix -listsPrefix $listsPrefix -gftcp $gfValues.TCP -gfudp $gfValues.UDP
+    $batFiles = @($fakeCandidates | ForEach-Object {
+        [PSCustomObject]@{
+            Name        = $_.Name
+            Id          = $_.Name
+            Args        = $selectedArgs
+            CommandLine = Build-CommandLine -argsArray $selectedArgs
+            FakeFile    = $_.Name
+        }
+    })
+    Write-Host "[INFO] Fake test: slot=$FakeSlot, strategy=$($selectedStrategy.name), candidates=$($batFiles.Count)" -ForegroundColor Gray
+}
 
 $globalResults = @()
 
@@ -505,12 +699,26 @@ function Read-ConfigSelection {
 
 while ($true) {
     $globalResults = @()
-$testType = Read-TestType
-$mode = Read-ModeSelection
-if ($mode -eq 'select') {
-    $selected = Read-ConfigSelection -allFiles $batFiles
-    $batFiles = @($selected)
-}
+
+    if ($GuiMode) {
+        # GUI uses the exact same test engine as the external PowerShell button,
+        # but skips the interactive menu so Electron can drive it headlessly.
+        $testType = $TestType
+        $mode = $RunMode
+    } else {
+        $testType = Read-TestType
+        $mode = Read-ModeSelection
+    }
+
+    if ($mode -eq 'select') {
+        if ($GuiMode) {
+            # A future GUI selector can pass a subset; for now GUI always uses all configs.
+            $mode = 'all'
+        } else {
+            $selected = Read-ConfigSelection -allFiles $batFiles
+            $batFiles = @($selected)
+        }
+    }
 
 if ($testType -eq 'dpi') {
     $dpiTargets = Build-DpiTargets -CustomHost $dpiCustomHost
@@ -519,7 +727,7 @@ if ($testType -eq 'dpi') {
 # Load targets once for standard mode
 $targetList = @()
 $maxNameLen = 10
-if ($testType -eq 'standard') {
+if ($testType -in @('standard','fake')) {
     $targetsFile = Join-Path $utilsDir "targets.txt"
     $rawTargets = New-OrderedDict
     if (Test-Path $targetsFile) {
@@ -565,7 +773,7 @@ if ($testType -eq 'standard') {
 
 # Ensure we have configs to run
 if (-not $batFiles -or $batFiles.Count -eq 0) {
-    Write-Host "[ERROR] No general*.bat files found" -ForegroundColor Red
+    Write-Host "[ERROR] No strategies found in strategies.json" -ForegroundColor Red
     Write-Host "Press any key to exit..." -ForegroundColor Yellow
     [void][System.Console]::ReadKey($true)
     exit 1
@@ -646,10 +854,17 @@ try {
     
     # Cleanup
     Stop-Zapret
+
+    if ($testType -eq 'fake' -and $file.FakeFile) {
+        $fakeTargetPath = Join-Path $binDir $fakeTargetName
+        Copy-Item -LiteralPath (Join-Path $binDir $file.FakeFile) -Destination $fakeTargetPath -Force
+        Write-Host "  > Active fake: $($file.FakeFile) -> $fakeTargetName" -ForegroundColor DarkGray
+    }
     
-    # Start config
+    # Start config: запускаем winws.exe напрямую с аргументами стратегии из JSON
+    # (working directory = bin, как и в main.js: spawn(WINWS_EXE, args, { cwd: BIN_DIR }))
     Write-Host "  > Starting config..." -ForegroundColor Cyan
-    $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$($file.FullName)`"" -WorkingDirectory $targetDir -PassThru -WindowStyle Minimized
+    $proc = Start-Process -FilePath $winwsExe -ArgumentList $file.CommandLine -WorkingDirectory $binDir -PassThru -WindowStyle Minimized
     
     # Wait init
     if (-not (Wait-WinwsReady)) {
@@ -658,7 +873,8 @@ try {
         continue
     }
     
-    if ($testType -eq 'standard') {
+    if ($testType -in @('standard','fake')) {
+        # В режиме fake запускается тот же полный standard suite.
         $curlTimeoutSeconds = $standardCurlTimeout
 
         # Parallel target checks via runspace pool (faster than jobs)
@@ -824,11 +1040,17 @@ try {
 
         }
 
-        $globalResults += @{ Config = $file.Name; Type = 'standard'; Results = $targetResults }
+        $resultType = 'standard'
+        $resultStrategyId = $null
+        if ($testType -eq 'fake') {
+            $resultType = 'fake'
+            $resultStrategyId = $StrategyId
+        }
+        $globalResults += @{ Config = $file.Name; Id = $file.Id; Type = $resultType; Results = $targetResults; FakeFile = $file.FakeFile; StrategyId = $resultStrategyId }
     } else {
         Write-Host "  > Running DPI checkers..." -ForegroundColor DarkGray
         $dpiResults = Invoke-DpiSuite -Targets $dpiTargets -TimeoutSeconds $dpiTimeoutSeconds -RangeBytes $dpiRangeBytes -MaxParallel $dpiMaxParallel
-        $globalResults += @{ Config = $file.Name; Type = 'dpi'; Results = $dpiResults }
+        $globalResults += @{ Config = $file.Name; Id = $file.Id; Type = 'dpi'; Results = $dpiResults }
     }
     
     # Stop
@@ -842,7 +1064,7 @@ try {
     # Analytics
     $analytics = @{}
     foreach ($res in $globalResults) {
-        if ($res.Type -eq 'standard') {
+        if ($res.Type -in @('standard','fake')) {
             foreach ($targetRes in $res.Results) {
                 $config = $res.Config
                 if (-not $analytics.ContainsKey($config)) { $analytics[$config] = @{ OK = 0; ERROR = 0; UNSUP = 0; PingOK = 0; PingFail = 0 } }
@@ -921,7 +1143,7 @@ try {
         $type = $res.Type
         $results = $res.Results
         [void]$resultLines.Add("Config: $config (Type: $type)")
-        if ($type -eq 'standard') {
+        if ($type -in @('standard','fake')) {
             foreach ($targetRes in $results) {
                 $name = $targetRes.Name
                 $http = $targetRes.HttpTokens -join ' '
@@ -973,6 +1195,21 @@ try {
 
     Write-Host "Results saved to $resultFile" -ForegroundColor Green
 
+    if ($GuiMode) {
+        # One-line UTF-8-safe payload for Electron. The GUI still receives the
+        # normal console output above, while this marker carries the full result set.
+        $guiPayload = @{
+            version    = 1
+            type       = $testType
+            results    = @($globalResults)
+            analytics  = $analytics
+            best       = $bestConfig
+            resultFile = $resultFile
+        } | ConvertTo-Json -Depth 30 -Compress
+        $guiBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($guiPayload))
+        Write-Output "__ZAPRET_GUI_RESULT__:$guiBase64"
+    }
+
 } catch {
     Write-Host "[ERROR] An error occurred during tests. Restoring ipset..." -ForegroundColor Red
     if ($originalIpsetStatus -and $originalIpsetStatus -ne "any") {
@@ -981,6 +1218,17 @@ try {
     Remove-Item -Path $ipsetFlagFile -ErrorAction SilentlyContinue
 } finally {
     Stop-Zapret
+    if ($testType -eq 'fake' -and $fakeTargetName) {
+        try {
+            $fakeTargetPath = Join-Path $binDir $fakeTargetName
+            if ($null -ne $fakeOriginalBytes) {
+                [IO.File]::WriteAllBytes($fakeTargetPath, $fakeOriginalBytes)
+                Write-Host "[INFO] Restored original $fakeTargetName" -ForegroundColor DarkGray
+            }
+        } catch {
+            Write-Host "[WARN] Failed to restore ${fakeTargetName}: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
     Restore-WinwsSnapshot -snapshot $originalWinws
     if ($originalIpsetStatus -ne "any") {
         Write-Host "[INFO] Restoring original ipset mode..." -ForegroundColor DarkGray
@@ -988,6 +1236,10 @@ try {
     }
     Remove-Item -Path $ipsetFlagFile -ErrorAction SilentlyContinue
 }
+
+    if ($GuiMode) {
+        exit 0
+    }
 
     Write-Host "Press any key to close..." -ForegroundColor Yellow
     [void][System.Console]::ReadKey($true)

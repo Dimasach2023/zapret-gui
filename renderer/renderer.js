@@ -253,7 +253,6 @@ bindAsyncButton('btnSvcInstall', () => window.api.serviceInstall());
 bindAsyncButton('btnSvcRemove', () => window.api.serviceRemove());
 bindAsyncButton('btnIpsetCycle', () => window.api.ipsetCycle());
 bindAsyncButton('btnUpdateIpset', () => window.api.updateIpset());
-bindAsyncButton('btnCheckUpdates', () => window.api.checkUpdates());
 bindAsyncButton('btnUpdateZapret', () => window.api.updateZapretFiles());
 bindAsyncButton('btnUpdateHosts', () => window.api.updateHosts());
 chkAutoUpdateCheck.addEventListener('change', (e) => window.api.toggleAutoUpdateCheck(e.target.checked));
@@ -261,21 +260,25 @@ bindAsyncButton('btnApplyDiscordFake', () => window.api.replaceFake('discord', f
 bindAsyncButton('btnApplyGameFake', () => window.api.replaceFake('game', fakeGameSelect.value));
 bindAsyncButton('btnAutoPickDiscord', async () => {
   document.getElementById('autoPickResultsDiscord').innerHTML = '';
-  const res = await window.api.autoPickFake('discord', document.getElementById('probeHost').value, document.getElementById('probePort').value);
+  const res = await window.api.autoPickFake('discord');
   if (res && res.best) fakeDiscordSelect.value = res.best; // только подставляем в список — не применяем
   renderAutoPickResults('discord', res);
 }, ['btnAutoPickGame', 'btnRunTests']);
 bindAsyncButton('btnAutoPickGame', async () => {
   document.getElementById('autoPickResultsGame').innerHTML = '';
-  const res = await window.api.autoPickFake('game', document.getElementById('probeHost').value, document.getElementById('probePort').value);
+  const res = await window.api.autoPickFake('game');
   if (res && res.best) fakeGameSelect.value = res.best; // только подставляем в список — не применяем
   renderAutoPickResults('game', res);
 }, ['btnAutoPickDiscord', 'btnRunTests']);
 bindAsyncButton('btnDiagnostics', () => window.api.runDiagnostics());
 bindAsyncButton('btnRunTests', async () => {
   document.getElementById('strategyTestResults').innerHTML = '';
-  const results = await window.api.runTests();
-  renderStrategyTestResults(results);
+  strategyTestBestName = '';
+  // Rendering is driven by the final strategy-test event, which contains the
+  // exact analytics emitted by the original PowerShell tester. Do not render
+  // the returned simplified array here, otherwise the authoritative stats
+  // would be overwritten by derived values.
+  await window.api.runTests();
 }, ['btnAutoPickDiscord', 'btnAutoPickGame']);
 bindAsyncButton('btnRunTestsExternal', () => window.api.runTestsExternal());
 bindAsyncButton('btnUseCustomHosts', () => window.api.toggleCustomHosts(true));
@@ -310,88 +313,209 @@ bindAsyncButton('btnTgwsOpenLink', () => window.api.tgwsOpenLink());
 window.api.onState(renderState);
 window.api.onLog(appendLog);
 window.api.onNotify(showToast);
-window.api.onAutoPickProgress(({ slot, index, total, file, status, ms, best }) => {
+window.api.onAutoPickProgress(({ slot, index, total, file, status, ms, stats, best }) => {
   const el = document.getElementById(slot === 'discord' ? 'progressDiscord' : 'progressGame');
   if (!el) return;
   el.className = 'progress-line' + (status === 'ok' ? ' ok' : status === 'fail' ? ' fail' : '');
   if (status === 'testing') el.textContent = `Тестирую ${index}/${total}: ${file}...`;
-  else if (status === 'ok') el.textContent = `✓ ${index}/${total}: ${file} — ${ms} мс`;
-  else if (status === 'fail') el.textContent = `✕ ${index}/${total}: ${file} — недоступно`;
-  else if (status === 'finished') el.textContent = best ? `Готово. Лучший вариант: ${best} — выберите и нажмите «Применить».` : 'Готово. Ни один файл не прошёл проверку.';
+  else if (status === 'ok') {
+    const suffix = stats ? ` — OK ${stats.OK ?? 0}, ERR ${stats.ERROR ?? 0}, UNSUP ${stats.UNSUP ?? 0}, Ping ${stats.PingOK ?? 0}/${(stats.PingOK ?? 0) + (stats.PingFail ?? 0)}` : '';
+    el.textContent = `✓ ${index}/${total}: ${file}${suffix}`;
+  } else if (status === 'fail') {
+    el.textContent = `✕ ${index}/${total}: ${file} — ошибка запуска/теста`;
+  } else if (status === 'finished') {
+    el.textContent = best ? `Готово. Лучший вариант: ${best} — выберите и нажмите «Применить».` : 'Готово. Ни один файл не получил положительного результата.';
+  }
 });
 
-// Показывает ранжированный список результатов автоподбора с явной кнопкой
-// «Применить» у каждой строки — раньше лучший файл применялся автоматически
-// и незаметно (только тост на 5 секунд), теперь пользователь сам видит все
-// варианты и явно нажимает «Применить» на выбранном.
+// Автоподбор fake теперь использует тот же полноценный PowerShell-тестер,
+// что и тест стратегий: один и тот же targets.txt, HTTP/TLS/ping, параллельные
+// проверки и оригинальный $analytics. В таблице показываем именно эти реальные
+// значения, без отдельной эвристики Node.js.
 function renderAutoPickResults(slot, res) {
   const el = document.getElementById(slot === 'discord' ? 'autoPickResultsDiscord' : 'autoPickResultsGame');
   const select = slot === 'discord' ? fakeDiscordSelect : fakeGameSelect;
   if (!el) return;
-  if (!res || !res.results || res.results.length === 0) {
+  if (!res || !Array.isArray(res.results) || res.results.length === 0) {
     el.innerHTML = '';
     return;
   }
-  const rows = res.results
-    .map((r) => {
-      const isBest = res.best && r.file === res.best;
-      const scoreText = r.ok ? `${r.ms} мс` : 'недоступно';
-      return `
+  const rows = res.results.map((r) => {
+    const a = r.analytics || {};
+    const isBest = res.best && r.file === res.best;
+    return `
       <tr class="${isBest ? 'best' : ''}" data-file="${escapeHtml(r.file)}">
-        <td>${isBest ? '★ ' : ''}${escapeHtml(r.file)}</td>
-        <td class="score">${escapeHtml(scoreText)}</td>
-        <td class="score"><button type="button" class="btn ghost small autopick-apply-btn">Применить</button></td>
+        <td><div class="strategy-name">${isBest ? '★ ' : ''}${escapeHtml(r.file)}</div></td>
+        <td class="stat-ok">${Number(a.OK) || 0}</td>
+        <td>${Number(a.ERROR) || 0}</td>
+        <td>${Number(a.UNSUP) || 0}</td>
+        <td>${Number(a.PingOK) || 0}</td>
+        <td>${Number(a.PingFail) || 0}</td>
       </tr>`;
-    })
-    .join('');
-  el.innerHTML = `<table><tbody>${rows}</tbody></table>`;
+  }).join('');
+  el.innerHTML = `
+    <table class="strategy-test-table">
+      <thead><tr>
+        <th>Fake-файл</th><th>HTTP OK</th><th>ERR</th><th>UNSUP</th><th>Ping OK</th><th>Fail</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
   el.querySelectorAll('tr[data-file]').forEach((row) => {
     const file = row.dataset.file;
     row.addEventListener('click', () => {
       select.value = file;
-      showToast({ type: 'info', text: `Выбрано в списке: ${file}. Нажмите «Применить».` });
-    });
-    row.querySelector('.autopick-apply-btn').addEventListener('click', async (e) => {
-      e.stopPropagation();
-      select.value = file;
-      await window.api.replaceFake(slot, file);
+      showToast({ type: 'info', text: `Выбрано: ${file}. Нажмите «Применить».` });
     });
   });
 }
 
-function renderStrategyTestResults(results) {
+let strategyTestBestName = '';
+
+function renderStrategyTestResults(results, analytics = {}, bestName = '') {
   const el = document.getElementById('strategyTestResults');
   if (!el) return;
-  if (!results || results.length === 0) {
+  if (!Array.isArray(results) || !results.length) {
     el.innerHTML = '';
     return;
   }
-  const bestScore = results[0].ok;
-  const rows = results
-    .map(
-      (r) => `
-      <tr class="${r.ok === bestScore && bestScore > 0 ? 'best' : ''}" data-strategy-id="${escapeHtml(r.id)}">
-        <td>${escapeHtml(r.name)}</td>
-        <td class="score">${escapeHtml(r.ok)}/${escapeHtml(r.total)}</td>
-      </tr>`
-    )
-    .join('');
-  el.innerHTML = `<table><tbody>${rows}</tbody></table>`;
+
+  const safeAnalytics = analytics && typeof analytics === 'object' ? analytics : {};
+  const rows = results.map((r) => {
+    // The analytics object is the authoritative source: it is produced by the
+    // original PowerShell tester and is NOT recalculated in the renderer.
+    const a = safeAnalytics[r.name] || safeAnalytics[r.id] || {};
+    const isStandard = Object.prototype.hasOwnProperty.call(a, 'PingOK') || r.type === 'standard';
+    const isBest = bestName ? r.name === bestName : false;
+
+    const targetRows = Array.isArray(r.perTarget) ? r.perTarget : [];
+    const targetSummary = targetRows.map((t) => {
+      const httpOk = Number(t.httpOk) || 0;
+      const httpTotal = Number(t.httpTotal) || 0;
+      const ping = t.ping && t.ping !== 'n/a' ? String(t.ping) : 'n/a';
+      const pingOnly = httpTotal === 0 && t.isUrl === false;
+
+      // PING-only targets (for example public DNS) must never be shown as
+      // failed HTTP targets. They have no HTTP/TLS checks by design, so the
+      // only meaningful status is the ping result.
+      if (pingOnly) {
+        const pingOk = ping !== 'n/a' && !/^timeout$/i.test(ping);
+        const state = pingOk ? '✓' : '✕';
+        const cls = pingOk ? 'target-ok' : 'target-fail';
+        return `<div class="strategy-target ${cls}"><span>${state}</span> ${escapeHtml(t.name)} <small>Ping: ${escapeHtml(ping)}</small></div>`;
+      }
+
+      let state = '✕';
+      let cls = 'target-fail';
+      if (httpOk === httpTotal && httpTotal > 0) {
+        state = '✓'; cls = 'target-ok';
+      } else if (httpOk > 0) {
+        state = '≈'; cls = 'target-partial';
+      } else if (httpTotal > 0 && Array.isArray(t.httpTokens) && t.httpTokens.every((x) => /:UNSUP\b/i.test(x))) {
+        state = '!'; cls = 'target-unsupported';
+      }
+      const http = `HTTP ${httpOk}/${httpTotal}`;
+      const pingText = ping !== 'n/a' ? ` · Ping: ${ping}` : '';
+      return `<div class="strategy-target ${cls}"><span>${state}</span> ${escapeHtml(t.name)} <small>${escapeHtml(http + pingText)}</small></div>`;
+    }).join('');
+
+    if (isStandard) {
+      return `
+        <tr class="${isBest ? 'best' : ''}" data-strategy-id="${escapeHtml(r.id)}">
+          <td>
+            <div class="strategy-name">${escapeHtml(r.name)}</div>
+            <div class="strategy-targets">${targetSummary || '<span class="muted">нет данных</span>'}</div>
+          </td>
+          <td class="stat-ok">${Number(a.OK) || 0}</td>
+          <td>${Number(a.ERROR) || 0}</td>
+          <td>${Number(a.UNSUP) || 0}</td>
+          <td>${Number(a.PingOK) || 0}</td>
+          <td>${Number(a.PingFail) || 0}</td>
+        </tr>`;
+    }
+
+    return `
+      <tr class="${isBest ? 'best' : ''}" data-strategy-id="${escapeHtml(r.id)}">
+        <td>
+          <div class="strategy-name">${escapeHtml(r.name)}</div>
+          <div class="strategy-targets">${targetSummary || '<span class="muted">нет данных</span>'}</div>
+        </td>
+        <td class="stat-ok">${Number(a.OK) || 0}</td>
+        <td>${Number(a.FAIL) || 0}</td>
+        <td>${Number(a.UNSUPPORTED) || 0}</td>
+        <td>${Number(a.LIKELY_BLOCKED) || 0}</td>
+      </tr>`;
+  }).join('');
+
+  const hasStandardAnalytics = results.some((r) => {
+    const a = safeAnalytics[r.name] || safeAnalytics[r.id];
+    return a && Object.prototype.hasOwnProperty.call(a, 'PingOK');
+  }) || results.some((r) => r.type === 'standard');
+
+  el.innerHTML = hasStandardAnalytics ? `
+    <table class="strategy-test-table">
+      <thead>
+        <tr>
+          <th>Стратегия / проверки</th>
+          <th>HTTP OK</th>
+          <th>ERR</th>
+          <th>UNSUP</th>
+          <th>Ping OK</th>
+          <th>Fail</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="hint strategy-test-footnote">
+      Статистика в этой таблице взята напрямую из <code>$analytics</code> оригинального <code>test zapret.ps1</code>. Значения не пересчитываются JavaScript.
+    </div>` : `
+    <table class="strategy-test-table">
+      <thead>
+        <tr>
+          <th>Стратегия / проверки</th>
+          <th>OK</th>
+          <th>FAIL</th>
+          <th>UNSUP</th>
+          <th>BLOCKED</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="hint strategy-test-footnote">
+      Статистика в этой таблице взята напрямую из <code>$analytics</code> оригинального <code>test zapret.ps1</code>.
+    </div>`;
+
   el.querySelectorAll('tr[data-strategy-id]').forEach((row) => {
     row.addEventListener('click', () => {
       window.api.selectStrategy(row.dataset.strategyId).then(renderState);
-      showToast({ type: 'info', text: `Выбрана стратегия: ${row.querySelector('td').textContent}` });
+      showToast({ type: 'info', text: `Выбрана стратегия: ${row.querySelector('.strategy-name')?.textContent || row.dataset.strategyId}` });
     });
   });
 }
-window.api.onStrategyTestProgress(({ index, total, name, status, ok, targetsTotal }) => {
+
+window.api.onStrategyTestProgress(({ index, total, name, status, ok, targetsTotal, best, resultFile, results, analytics }) => {
   const el = document.getElementById('progressStrategyTest');
   if (!el) return;
-  el.className = 'progress-line' + (status === 'done' && ok === 0 ? ' fail' : status === 'done' && ok === targetsTotal ? ' ok' : '');
-  if (status === 'start') el.textContent = `Подготовка теста ${total} стратегий...`;
-  else if (status === 'testing') el.textContent = `Тестирую ${index}/${total}: ${name}...`;
-  else if (status === 'done') el.textContent = `${index}/${total}: ${name} — ${ok}/${targetsTotal}`;
-  else if (status === 'finished') el.textContent = `Готово: проверено ${total} стратегий.`;
+  if (status === 'start') {
+    el.className = 'progress-line';
+    el.textContent = `Подготовка полного теста ${total} стратегий...`;
+  } else if (status === 'testing') {
+    el.className = 'progress-line';
+    el.textContent = `Тестирую ${index}/${total}: ${name}...`;
+  } else if (status === 'done') {
+    const cls = ok === 0 ? ' fail' : (targetsTotal && ok === targetsTotal ? ' ok' : '');
+    el.className = 'progress-line' + cls;
+    el.textContent = `${index}/${total}: ${name} — ${ok}/${targetsTotal}`;
+  } else if (status === 'finished') {
+    strategyTestBestName = best || '';
+    el.className = 'progress-line ok';
+    el.textContent = best
+      ? `Готово: проверено ${total} стратегий. Лучшая: ${best}.`
+      : `Готово: проверено ${total} стратегий.`;
+    if (Array.isArray(results)) renderStrategyTestResults(results, analytics, strategyTestBestName);
+    if (resultFile) {
+      showToast({ type: 'info', text: `Результаты сохранены: ${resultFile}` });
+    }
+  }
 });
 
 window.api.requestState().then(renderState);
