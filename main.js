@@ -339,6 +339,11 @@ let config = Object.assign(
     customHostsCachedText: '',
     customHostsCachedHash: '',
     customHostsCachedAt: null,
+    // ---- DNS (вкладка DNS) ----
+    dnsEnabled: false, // включён ли сейчас переключаемый DNS
+    dnsPrimary: '9.9.9.9', // Quad9 по умолчанию
+    dnsSecondary: '149.112.112.112', // альтернативный Quad9 по умолчанию
+    dohActive: false, // включён ли DoH (DNS поверх HTTPS) для текущих адресов
   },
   loadConfigFile()
 );
@@ -1045,7 +1050,7 @@ async function toggleCustomHosts(enable) {
       const lines = getCustomHostsLines();
       applyCustomHostsBlock(lines);
       sendLog(`> Дополнение hosts от разработчика GUI добавлено (${lines.length} строк).`);
-      notify('success', 'Дополнение hosts добавлено (WhatsApp/Facebook/Instagram/Roblox).');
+      notify('success', `Дополнение hosts добавлено (${lines.length} строк).`);
     } else {
       const hostsPath = getHostsPath();
       let content = readHostsFile();
@@ -1067,6 +1072,283 @@ async function toggleCustomHosts(enable) {
 }
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ---------- DNS (вкладка DNS) ----------
+function isValidIPv4(ip) {
+  if (typeof ip !== 'string') return false;
+  const m = ip.trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  return m.slice(1).every((o) => Number(o) >= 0 && Number(o) <= 255);
+}
+// Известные публичные DNS-серверы и их DoH-шаблоны (DNS поверх HTTPS).
+// Нужно, чтобы при включении DNS зашифровать сами DNS-запросы и защититься
+// от перехвата/подмены DNS на уровне провайдера (в т.ч. блокировки РКН),
+// которые обычно работают именно с обычным нешифрованным DNS (порт 53).
+// Windows не позволяет резолвить DoH-хост автоматически (иначе пришлось бы
+// сначала сходить в обычный DNS, а его как раз и могут перехватить), поэтому
+// пары "IP -> шаблон" для популярных провайдеров знаем заранее. Список
+// расширен, чтобы кнопки-пресеты (и совпадающие с ними ручные адреса)
+// всегда получали DoH автоматически, без ручного ввода шаблона.
+const DOH_TEMPLATES = {
+  // Quad9
+  '9.9.9.9': 'https://dns.quad9.net/dns-query',
+  '149.112.112.112': 'https://dns.quad9.net/dns-query',
+  // Google Public DNS
+  '8.8.8.8': 'https://dns.google/dns-query',
+  '8.8.4.4': 'https://dns.google/dns-query',
+  // Cloudflare
+  '1.1.1.1': 'https://cloudflare-dns.com/dns-query',
+  '1.0.0.1': 'https://cloudflare-dns.com/dns-query',
+  '1.1.1.2': 'https://security.cloudflare-dns.com/dns-query',
+  '1.0.0.2': 'https://security.cloudflare-dns.com/dns-query',
+  '1.1.1.3': 'https://family.cloudflare-dns.com/dns-query',
+  '1.0.0.3': 'https://family.cloudflare-dns.com/dns-query',
+  // OpenDNS (Cisco)
+  '208.67.222.222': 'https://doh.opendns.com/dns-query',
+  '208.67.220.220': 'https://doh.opendns.com/dns-query',
+  '208.67.222.123': 'https://doh.familyshield.opendns.com/dns-query',
+  '208.67.220.123': 'https://doh.familyshield.opendns.com/dns-query',
+  // AdGuard DNS
+  '94.140.14.14': 'https://dns.adguard-dns.com/dns-query',
+  '94.140.15.15': 'https://dns.adguard-dns.com/dns-query',
+  '94.140.14.15': 'https://dns-family.adguard-dns.com/dns-query',
+  '94.140.15.16': 'https://dns-family.adguard-dns.com/dns-query',
+  '94.140.14.140': 'https://dns-unfiltered.adguard-dns.com/dns-query',
+  '94.140.14.141': 'https://dns-unfiltered.adguard-dns.com/dns-query',
+  // CleanBrowsing
+  '185.228.168.9': 'https://doh.cleanbrowsing.org/doh/family-filter/',
+  '185.228.169.9': 'https://doh.cleanbrowsing.org/doh/family-filter/',
+  '185.228.168.10': 'https://doh.cleanbrowsing.org/doh/adult-filter/',
+  '185.228.169.11': 'https://doh.cleanbrowsing.org/doh/adult-filter/',
+  // Yandex DNS
+  '77.88.8.8': 'https://common.dot.dns.yandex.net/dns-query',
+  '77.88.8.1': 'https://common.dot.dns.yandex.net/dns-query',
+  '77.88.8.7': 'https://family.dot.dns.yandex.net/dns-query',
+  '77.88.8.3': 'https://family.dot.dns.yandex.net/dns-query',
+  // NextDNS anycast
+  '45.90.28.0': 'https://dns.nextdns.io',
+  '45.90.30.0': 'https://dns.nextdns.io',
+  // Mullvad DNS
+  '194.242.2.2': 'https://dns.mullvad.net/dns-query',
+  '194.242.2.3': 'https://adblock.dns.mullvad.net/dns-query',
+  // ControlD
+  '76.76.2.0': 'https://freedns.controld.com/p0',
+  '76.76.10.0': 'https://freedns.controld.com/p0',
+};
+// Кэш результатов автоматического определения DoH для IP, которых нет в
+// списке выше — чтобы не долбить сеть повторными HTTPS-запросами при каждом
+// включении DNS.
+const dohAutoDetectCache = new Map();
+function getDohTemplate(ip) {
+  const key = (ip || '').trim();
+  if (!key) return null;
+  if (DOH_TEMPLATES[key]) return DOH_TEMPLATES[key];
+  if (dohAutoDetectCache.has(key)) return dohAutoDetectCache.get(key);
+  return null;
+}
+// Автоматически пытается определить DoH для произвольного (неизвестного из
+// списка) DNS-адреса: часть публичных DoH-серверов отвечает на
+// https://<IP>/dns-query напрямую по IP (без отдельного домена, используя
+// сертификат по SAN=IP или просто принимая любой SNI). Делаем короткий
+// HEAD/GET-запрос с малым таймаутом на стандартный DoH-путь; если сервер
+// отвечает похоже на DoH (валидный HTTPS-ответ, не таймаут/обрыв соединения),
+// считаем, что автообнаружение сработало, и кэшируем шаблон на этот IP.
+function probeDohByIp(ip) {
+  return new Promise((resolve) => {
+    const template = `https://${ip}/dns-query`;
+    const req = https.request(
+      {
+        host: ip,
+        path: '/dns-query',
+        method: 'GET',
+        timeout: 2500,
+        rejectUnauthorized: false, // сертификат обычно выписан на домен, а не IP — не блокируем из-за этого
+        headers: { accept: 'application/dns-message' },
+      },
+      (res) => {
+        res.destroy();
+        // Любой валидный HTTP-ответ (даже 400/404) означает, что там живёт
+        // веб/DoH-сервер на 443, а не что-то совсем постороннее.
+        resolve(res.statusCode ? template : null);
+      }
+    );
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(null);
+    });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+// Пытается определить DoH-шаблон для адреса: сначала смотрим в списке
+// известных провайдеров, если там нет — пробуем автообнаружение по IP.
+// Используется перед включением DNS, чтобы получить шаблон даже для
+// адресов, которых нет в захардкоженном списке (включая произвольные,
+// введённые вручную).
+async function resolveDohTemplate(ip) {
+  const key = (ip || '').trim();
+  if (!key) return null;
+  if (DOH_TEMPLATES[key]) return DOH_TEMPLATES[key];
+  if (dohAutoDetectCache.has(key)) return dohAutoDetectCache.get(key);
+  const detected = await probeDohByIp(key);
+  dohAutoDetectCache.set(key, detected);
+  return detected;
+}
+// Включает глобальную поддержку DoH в Windows (best-effort: на старых
+// системах команда может не поддерживаться — это не должно прерывать
+// включение DNS, поэтому ошибки игнорируются).
+async function enableDohGlobal() {
+  await run('netsh dns add global doh=yes');
+}
+// Регистрирует DoH-шаблон для конкретного DNS-сервера. Сначала удаляем
+// возможную старую запись (в т.ч. встроенную в Windows), чтобы применились
+// именно наши флаги autoupgrade=yes/udpfallback=no (без отката на
+// нешифрованный DNS при любой заминке с HTTPS).
+async function applyDohForServer(ip, templateArg) {
+  const template = templateArg || (await resolveDohTemplate(ip));
+  if (!template) return false;
+  await run(`netsh dns delete encryption server=${ip}`);
+  const res = await run(
+    `netsh dns add encryption server=${ip} dohtemplate=${template} autoupgrade=yes udpfallback=no`
+  );
+  return res.code === 0;
+}
+// Индексы активных ("Up") сетевых адаптеров — используем ifIndex через
+// PowerShell/Set-DnsClientServerAddress вместо netsh с именем адаптера,
+// т.к. имена адаптеров могут содержать кавычки/спецсимволы и различаются
+// на разных машинах, а ifIndex — просто число.
+async function getUpAdapterIndexes() {
+  const res = await run(
+    `powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -ExpandProperty ifIndex"`
+  );
+  if (res.code !== 0) return [];
+  return res.stdout
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => /^\d+$/.test(l))
+    .map(Number);
+}
+async function applyDnsServers(primary, secondary) {
+  const idxs = await getUpAdapterIndexes();
+  if (!idxs.length) throw new Error('Не найдено ни одного активного сетевого адаптера.');
+  const servers = [primary, secondary].filter(Boolean).map((ip) => `'${ip}'`).join(',');
+  for (const idx of idxs) {
+    const res = await run(
+      `powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-DnsClientServerAddress -InterfaceIndex ${idx} -ServerAddresses (${servers})"`
+    );
+    if (res.code !== 0) throw new Error(res.stderr || res.stdout || `Не удалось задать DNS на адаптере #${idx}.`);
+  }
+  // Поднимаем DoH (DNS поверх HTTPS) для указанных серверов, если для них
+  // известен шаблон — это шифрует сами DNS-запросы и защищает от перехвата
+  // DNS на уровне провайдера (в т.ч. блокировок РКН). Best-effort: если
+  // системе не поддерживается netsh dns encryption (старые сборки Windows)
+  // или адрес неизвестен, DNS всё равно продолжит работать, просто без DoH.
+  let dohApplied = false;
+  let dohUnsupported = false;
+  let dohNotFound = false;
+  try {
+    await enableDohGlobal();
+    for (const ip of [primary, secondary].filter(Boolean)) {
+      // resolveDohTemplate сначала смотрит в списке известных провайдеров,
+      // а для незнакомых IP сам пробует автообнаружение по HTTPS — так DoH
+      // включается автоматически для любого DNS, не только для пресетов.
+      const template = await resolveDohTemplate(ip);
+      if (!template) {
+        dohNotFound = true;
+        continue;
+      }
+      const ok = await applyDohForServer(ip, template);
+      if (ok) dohApplied = true;
+      else dohUnsupported = true;
+    }
+  } catch (e) {
+    // не прерываем включение DNS из-за проблем с DoH
+  }
+  return { dohApplied, dohUnsupported, dohNotFound };
+}
+async function resetDnsServers() {
+  const idxs = await getUpAdapterIndexes();
+  for (const idx of idxs) {
+    // best-effort: если какой-то адаптер не поддерживает сброс на DHCP, не
+    // прерываем весь процесс из-за него — остальные адаптеры всё равно
+    // должны вернуться на автоматический DNS.
+    await run(
+      `powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-DnsClientServerAddress -InterfaceIndex ${idx} -ResetServerAddresses"`
+    );
+  }
+}
+async function toggleDns(enable) {
+  try {
+    if (enable) {
+      const primary = (config.dnsPrimary || '9.9.9.9').trim();
+      const secondary = (config.dnsSecondary || '').trim();
+      if (!isValidIPv4(primary)) throw new Error('Некорректный основной DNS-адрес.');
+      if (secondary && !isValidIPv4(secondary)) throw new Error('Некорректный альтернативный DNS-адрес.');
+      const dohResult = await applyDnsServers(primary, secondary);
+      config.dnsEnabled = true;
+      config.dohActive = !!dohResult.dohApplied;
+      saveConfig();
+      const dohSuffix = dohResult.dohApplied
+        ? ' Включён DoH (DNS поверх HTTPS) — защита от перехвата DNS.'
+        : dohResult.dohUnsupported
+        ? ' DoH не удалось включить (не поддерживается этой версией Windows) — DNS работает без шифрования.'
+        : ' Не удалось автоматически определить DoH для этого адреса — DNS работает без шифрования.';
+      sendLog(`> DNS переключён на ${primary}${secondary ? ' / ' + secondary : ''}.${dohSuffix}`);
+      notify('success', `DNS переключён на ${primary}${secondary ? ' / ' + secondary : ''}.${dohSuffix}`);
+    } else {
+      await resetDnsServers();
+      config.dnsEnabled = false;
+      config.dohActive = false;
+      saveConfig();
+      sendLog('> DNS возвращён на автоматический (DHCP).');
+      notify('success', 'DNS возвращён на автоматический (DHCP).');
+    }
+  } catch (e) {
+    sendLog('[ERROR] Не удалось изменить DNS: ' + e.message);
+    notify('error', 'Не удалось изменить DNS: ' + e.message);
+  }
+  pushState();
+}
+// Сохраняет DNS-адреса, которые будут включаться/выключаться кнопками на
+// вкладке DNS. Если DNS сейчас включён, сразу же переприменяет новые
+// адреса, чтобы состояние UI и системы не расходились.
+async function setDnsServers(primary, secondary) {
+  primary = (primary || '').trim();
+  secondary = (secondary || '').trim();
+  if (!isValidIPv4(primary)) {
+    notify('error', 'Некорректный основной DNS-адрес.');
+    return { ok: false };
+  }
+  if (secondary && !isValidIPv4(secondary)) {
+    notify('error', 'Некорректный альтернативный DNS-адрес.');
+    return { ok: false };
+  }
+  config.dnsPrimary = primary;
+  config.dnsSecondary = secondary;
+  saveConfig();
+  sendLog(`> Сохранён DNS для переключения: ${primary}${secondary ? ' / ' + secondary : ''}.`);
+  notify('success', 'DNS-адреса сохранены.');
+  if (config.dnsEnabled) {
+    try {
+      const dohResult = await applyDnsServers(primary, secondary);
+      config.dohActive = !!dohResult.dohApplied;
+      saveConfig();
+      sendLog(
+        '> DNS переприменён с новыми адресами.' +
+          (dohResult.dohApplied
+            ? ' DoH (DNS поверх HTTPS) включён.'
+            : dohResult.dohUnsupported
+            ? ' DoH не удалось включить (не поддерживается этой версией Windows) — DNS работает без шифрования.'
+            : ' Не удалось автоматически определить DoH для этого адреса — DNS работает без шифрования.')
+      );
+    } catch (e) {
+      sendLog('[ERROR] Не удалось переприменить DNS: ' + e.message);
+      notify('error', 'Не удалось переприменить DNS: ' + e.message);
+    }
+  }
+  pushState();
+  return { ok: true };
 }
 
 // ---------- Редактирование списков (list-general, list-exclude и т.д.) прямо в GUI ----------
@@ -1774,6 +2056,10 @@ async function getStateObject() {
     customHostsLinesCount: getCustomHostsLines().length,
     customHostsCachedAt: config.customHostsCachedAt || null,
     autoUpdateCheck: config.autoUpdateCheck,
+    dnsEnabled: !!config.dnsEnabled,
+    dnsPrimary: config.dnsPrimary || '9.9.9.9',
+    dnsSecondary: config.dnsSecondary !== undefined ? config.dnsSecondary : '149.112.112.112',
+    dohActive: !!config.dohActive,
     binFiles: listBinFiles(),
     activeFakeDiscord: config.activeFakeDiscord,
     activeFakeGame: config.activeFakeGame,
@@ -2017,6 +2303,8 @@ ipcMain.handle('run-tests-external', () => runTests());
 ipcMain.handle('toggle-custom-hosts', (e, enable) => toggleCustomHosts(enable));
 ipcMain.handle('update-custom-hosts', () => updateCustomHostsFile());
 ipcMain.handle('set-custom-hosts-url', (e, url) => setCustomHostsSourceUrl(url));
+ipcMain.handle('toggle-dns', (e, enable) => toggleDns(enable));
+ipcMain.handle('set-dns-servers', (e, { primary, secondary }) => setDnsServers(primary, secondary));
 ipcMain.handle('list-lists', () => listEditableFiles());
 ipcMain.handle('read-list', (e, name) => {
   try {

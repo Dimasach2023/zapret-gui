@@ -24,6 +24,10 @@ const tgwsFakeTlsEl = document.getElementById('tgwsFakeTls');
 const chkTgwsNoCfproxy = document.getElementById('chkTgwsNoCfproxy');
 const tgwsLinkEl = document.getElementById('tgwsLink');
 let tgwsSettingsLoaded = false;
+const dnsPillEl = document.getElementById('dnsPill');
+const dnsPrimaryInput = document.getElementById('dnsPrimaryInput');
+const dnsSecondaryInput = document.getElementById('dnsSecondaryInput');
+let dnsSettingsLoaded = false;
 
 let strategiesLoaded = false;
 let binFilesLoaded = false;
@@ -166,6 +170,33 @@ function renderState(state) {
   customHostsInfoEl.textContent = `Строк в списке: ${state.customHostsLinesCount ?? 0}` +
     (cachedAt ? ` · последняя загрузка из репозитория: ${cachedAt}` : ' · список ещё ни разу не загружался из репозитория');
 
+  dnsPillEl.textContent = state.dnsEnabled ? 'включён' : 'выключен';
+  dnsPillEl.className = 'pill ' + (state.dnsEnabled ? 'applied' : 'notapplied');
+  document.getElementById('btnDnsEnable').disabled = !!state.dnsEnabled;
+  document.getElementById('btnDnsDisable').disabled = !state.dnsEnabled;
+  // поля с адресами заполняем один раз, чтобы не затирать то, что человек сейчас печатает
+  if (!dnsSettingsLoaded) {
+    dnsPrimaryInput.value = state.dnsPrimary || '9.9.9.9';
+    dnsSecondaryInput.value = state.dnsSecondary || '';
+    dnsSettingsLoaded = true;
+  }
+
+  const dnsDohPillEl = document.getElementById('dnsDohPill');
+  const dnsDohHintEl = document.getElementById('dnsDohHint');
+  if (!state.dnsEnabled) {
+    dnsDohPillEl.textContent = '—';
+    dnsDohPillEl.className = 'pill';
+    dnsDohHintEl.textContent = '';
+  } else if (state.dohActive) {
+    dnsDohPillEl.textContent = 'активен';
+    dnsDohPillEl.className = 'pill applied';
+    dnsDohHintEl.textContent = 'DNS-запросы шифруются (DNS поверх HTTPS) — защита от перехвата DNS.';
+  } else {
+    dnsDohPillEl.textContent = 'недоступен';
+    dnsDohPillEl.className = 'pill notapplied';
+    dnsDohHintEl.textContent = 'Не удалось включить DoH для этого DNS-адреса (сервер не поддерживает или недоступен) — DNS работает без шифрования.';
+  }
+
   versionHintEl.textContent = `Локальная версия: ${state.localVersion}`;
   document.getElementById('footerVersion').textContent = `zapret ${state.localVersion}`;
 
@@ -284,6 +315,18 @@ bindAsyncButton('btnRunTestsExternal', () => window.api.runTestsExternal());
 bindAsyncButton('btnUseCustomHosts', () => window.api.toggleCustomHosts(true));
 bindAsyncButton('btnRemoveCustomHosts', () => window.api.toggleCustomHosts(false));
 bindAsyncButton('btnUpdateCustomHosts', () => window.api.updateCustomHosts());
+
+// ---------- DNS tab ----------
+bindAsyncButton('btnDnsEnable', () => window.api.toggleDns(true), ['btnDnsDisable']);
+bindAsyncButton('btnDnsDisable', () => window.api.toggleDns(false), ['btnDnsEnable']);
+bindAsyncButton('btnDnsSave', () => window.api.setDnsServers(dnsPrimaryInput.value, dnsSecondaryInput.value));
+
+document.querySelectorAll('.dns-preset-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    dnsPrimaryInput.value = btn.dataset.primary || '';
+    dnsSecondaryInput.value = btn.dataset.secondary || '';
+  });
+});
 
 // ---------- Telegram (tg-ws-proxy) tab ----------
 bindAsyncButton('btnTgwsStart', () => window.api.tgwsStart());

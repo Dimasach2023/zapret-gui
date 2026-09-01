@@ -25,6 +25,8 @@ contextBridge.exposeInMainWorld('api', {
   toggleCustomHosts: (v) => ipcRenderer.invoke('toggle-custom-hosts', v),
   updateCustomHosts: () => ipcRenderer.invoke('update-custom-hosts'),
   setCustomHostsUrl: (url) => ipcRenderer.invoke('set-custom-hosts-url', url),
+  toggleDns: (v) => ipcRenderer.invoke('toggle-dns', v),
+  setDnsServers: (primary, secondary) => ipcRenderer.invoke('set-dns-servers', { primary, secondary }),
   listLists: () => ipcRenderer.invoke('list-lists'),
   readList: (name) => ipcRenderer.invoke('read-list', name),
   saveList: (name, content) => ipcRenderer.invoke('save-list', { name, content }),

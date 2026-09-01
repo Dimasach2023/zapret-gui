@@ -25,6 +25,7 @@
       <button class="tab" data-tab="advanced">Расширенные</button>
       <button class="tab" data-tab="tgws">Telegram</button>
       <button class="tab" data-tab="lists">Списки</button>
+      <button class="tab" data-tab="dns">DNS</button>
     </nav>
 
     <main class="content">
@@ -118,9 +119,11 @@
             <span class="pill" id="customHostsPill">—</span>
           </div>
           <div class="hint">
-            Добавляет в системный hosts альтернативные IP для WhatsApp, Facebook, Instagram и Roblox (tr.rbxcdn.com) —
-            может помочь, если основные адреса заблокированы у вашего провайдера. Требуются права администратора.
-            Список загружается из GitHub-репозитория (ниже) и кэшируется на случай отсутствия интернета.
+            Добавляет в системный hosts альтернативные IP для ряда сервисов — может помочь, если
+            основные адреса заблокированы у вашего провайдера. Список сервисов и адресов не
+            фиксирован: он загружается из GitHub-репозитория (ниже) и может обновляться, поэтому
+            здесь не указывается конкретный перечень. Требуются права администратора. Список
+            кэшируется на случай отсутствия интернета.
           </div>
           <div class="hint" id="customHostsInfo"></div>
           <div class="row">
@@ -276,6 +279,58 @@
           </div>
           <div class="hint">
             При первом сохранении файла рядом автоматически создаётся резервная копия «имя.txt.bak» с исходным содержимым.
+          </div>
+        </div>
+      </section>
+
+      <section class="tab-panel hidden" data-panel="dns">
+        <div class="card">
+          <div class="card-title row-between">
+            <span>DNS (Quad9)</span>
+            <span class="pill" id="dnsPill">—</span>
+          </div>
+          <div class="hint">
+            Переключает DNS-сервер на активных сетевых адаптерах на адреса, указанные ниже
+            (по умолчанию Quad9: основной 9.9.9.9 и альтернативный 149.112.112.112). При
+            отключении DNS возвращается на автоматический (DHCP). Требуются права администратора.
+          </div>
+          <div class="row controls">
+            <button id="btnDnsEnable" class="btn primary big">▶ Включить DNS</button>
+            <button id="btnDnsDisable" class="btn danger big">■ Отключить DNS</button>
+          </div>
+          <div class="row" style="margin-top:6px;">
+            <span class="mini-label">DoH</span>
+            <span class="pill" id="dnsDohPill">—</span>
+            <span class="hint" id="dnsDohHint" style="margin:0;"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Изменить DNS</div>
+          <div class="hint">
+            Здесь можно указать другой DNS вместо 9.9.9.9 и его альтернативного — именно эти
+            адреса будут использоваться кнопками «Включить DNS» / «Отключить DNS» выше.
+            Альтернативный адрес необязателен. DoH (DNS поверх HTTPS) для защиты DNS-запросов
+            от перехвата и подмены на уровне провайдера включается автоматически для любого
+            адреса: для известных публичных DNS (Quad9, Google, Cloudflare и др.) используется
+            готовый шаблон, а для остальных приложение само пробует определить поддержку DoH
+            по этому же адресу. Если сервер не поддерживает DoH, DNS всё равно продолжит
+            работать, просто без шифрования.
+          </div>
+          <div class="row">
+            <label class="mini-label">Основной</label>
+            <input type="text" id="dnsPrimaryInput" placeholder="9.9.9.9" />
+            <label class="mini-label">Альтернативный</label>
+            <input type="text" id="dnsSecondaryInput" placeholder="149.112.112.112" />
+          </div>
+          <div class="row">
+            <label class="mini-label">Готовые варианты</label>
+            <button type="button" class="btn small ghost dns-preset-btn" data-primary="9.9.9.9" data-secondary="149.112.112.112">Quad9 (9.9.9.9)</button>
+            <button type="button" class="btn small ghost dns-preset-btn" data-primary="8.8.8.8" data-secondary="8.8.4.4">Google (8.8.8.8)</button>
+            <button type="button" class="btn small ghost dns-preset-btn" data-primary="1.1.1.1" data-secondary="1.0.0.1">Cloudflare (1.1.1.1)</button>
+          </div>
+          <div class="row controls">
+            <button id="btnDnsSave" class="btn secondary">Изменить DNS</button>
           </div>
         </div>
       </section>
